@@ -241,11 +241,7 @@ struct rt_can_hdr
 #endif
 struct rt_can_device;
 typedef rt_err_t (*rt_canstatus_ind)(struct rt_can_device *, void *);
-typedef struct rt_can_status_ind_type
-{
-    rt_canstatus_ind ind;
-    void *args;
-} *rt_can_status_ind_type_t;
+
 typedef void (*rt_can_bus_hook)(struct rt_can_device *);
 struct rt_can_device
 {
@@ -255,10 +251,6 @@ struct rt_can_device
     struct can_configure config;
     struct rt_can_status status;
 
-    rt_uint32_t timerinitflag;
-    struct rt_timer timer;
-
-    struct rt_can_status_ind_type status_indicate;
 #ifdef RT_CAN_USING_HDR
     struct rt_can_hdr *hdr;
 #endif
@@ -336,14 +328,12 @@ struct rt_can_rx_fifo
 struct rt_can_sndbxinx_list
 {
     struct rt_list_node list;
-    struct rt_completion completion;
     rt_uint32_t result;
 };
 
 struct rt_can_tx_fifo
 {
     struct rt_can_sndbxinx_list *buffer;
-    struct rt_semaphore sem;
     struct rt_list_node freelist;
 };
 
