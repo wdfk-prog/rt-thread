@@ -673,7 +673,7 @@ rt_err_t rt_alarm_delete(rt_alarm_t alarm)
 
 /** \brief create an alarm
  *
- * \param flag set alarm mode e.g: RT_ALARM_DAILY
+ * \param callback user-defined function to handle alarm events
  * \param setup pointer to setup infomation
  */
 rt_alarm_t rt_alarm_create(rt_alarm_callback_t callback, struct rt_alarm_setup *setup)
