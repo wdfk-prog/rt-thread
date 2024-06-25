@@ -387,6 +387,10 @@ static rt_err_t rtc_alarm_time_set(struct rtc_device_object* p_dev)
             Alarm_InitStruct.AlarmTime.Seconds);
         rt_rtc_alarm_enable();
     }
+    else
+    {
+        rt_rtc_alarm_disable();
+    }
 
     return RT_EOK;
 }

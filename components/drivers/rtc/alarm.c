@@ -9,11 +9,14 @@
  * 2013-05-17     aozima            initial alarm event & mutex in system init.
  * 2020-10-15     zhangsz           add alarm flags hour minute second.
  * 2020-11-09     zhangsz           fix alarm set when modify rtc time.
+ * 2024-06-25     wdfk-prog         use timestamp list
  */
 
 #include <rtthread.h>
 #include <rtdevice.h>
 #include <sys/time.h>
+
+#if (defined(RT_USING_RTC) && defined(RT_USING_ALARM))
 
 #define RT_RTC_YEARS_MAX         137
 #ifdef RT_USING_SOFT_RTC
@@ -22,44 +25,147 @@
 #define RT_ALARM_DELAY             2
 #endif
 
-#if (defined(RT_USING_RTC) && defined(RT_USING_ALARM))
+#define ALARM_STACK_SIZE            2048
+#define ALARM_PRIORITY              10
+#define ALARM_TICKS                 5
+struct rt_alarm_container
+{
+    rt_alarm_t head;
+    struct rt_mutex mutex;
+    struct rt_event event;
+
+    rt_uint32_t flag;
+    time_t context_timestamp;
+};
+
 static struct rt_alarm_container _container;
 
-rt_inline rt_uint32_t alarm_mkdaysec(struct tm *time)
+static rt_err_t alarm_set(rt_alarm_t alarm);
+
+static time_t set_timer_context(void)
 {
-    rt_uint32_t sec;
-
-    sec = time->tm_sec;
-    sec += time->tm_min * 60;
-    sec += time->tm_hour * 3600;
-
-    return (sec);
+    get_timestamp(&_container.context_timestamp);
+    return _container.context_timestamp;
 }
 
-static rt_err_t alarm_set(struct rt_alarm *alarm)
+static time_t get_timer_context(void)
 {
-    rt_device_t device;
-    struct rt_rtc_wkalarm wkalarm;
-    rt_err_t ret;
+    return _container.context_timestamp;
+}
+
+static time_t get_elapsed_time(void)
+{
+    time_t timestamp = 0;
+    get_timestamp(&timestamp);
+
+    return (timestamp - _container.context_timestamp);
+}
+
+static rt_err_t start_timer(rt_alarm_t alarm)
+{
+    /* start alarm */
+    _container.flag |= RT_ALARM_STATE_START;
+
+    return alarm_set(alarm);
+}
+
+static rt_err_t stop_timer(rt_alarm_t alarm)
+{
+    /* stop alarm */
+    _container.flag &= ~RT_ALARM_STATE_START;
+
+    return alarm_set(alarm);
+}
+
+/**
+ * @brief Sets a timeout with the duration "timestamp"
+ */
+static void set_timeout(rt_alarm_t alarm)
+{
+    time_t timestamp = get_elapsed_time() + RT_ALARM_DELAY;
+    /* In case deadline too soon */
+    if(alarm->timestamp < timestamp)
+    {
+        alarm->timestamp = timestamp;
+    }
+
+    start_timer(alarm);
+}
+
+/**
+ * @brief Adds a timer to the list.
+ *
+ * @remark The list is automatically sorted. The list head always contains the
+ *     next timer to expire.
+ */
+static void insert_timer(rt_alarm_t node)
+{
+    rt_alarm_t cur = _container.head;
+    rt_alarm_t next = _container.head->next;
+
+    while (cur->next != RT_NULL)
+    {  
+        if(node->timestamp  > next->timestamp)
+        {
+            cur = next;
+            next = next->next;
+        }
+        else
+        {
+            cur->next = node;
+            node->next = next;
+            return;
+        }
+    }
+    cur->next = node;
+    node->next = RT_NULL;
+}
+
+/**
+ * @brief Adds or replace the head timer of the list.
+ *
+ * @remark The list is automatically sorted. The list head always contains the
+ *         next timer to expire.
+ */
+static void insert_new_head_timer(rt_alarm_t node)
+{
+    rt_alarm_t cur = _container.head;
+
+    node->next = cur;
+    _container.head = node;
+    set_timeout(alarm);
+}
+
+static rt_err_t alarm_set(rt_alarm_t alarm)
+{
+    rt_device_t device = RT_NULL;
+    struct rt_rtc_wkalarm wkalarm = {0};
+    rt_err_t ret = -RT_ERROR;
+    struct tm wktime = {0};
 
     device = rt_device_find("rtc");
 
     if (device == RT_NULL)
     {
-        return (RT_ERROR);
+        return -RT_ERROR;
     }
 
     if (alarm->flag & RT_ALARM_STATE_START)
+    {
         wkalarm.enable = RT_TRUE;
+    }
     else
+    {
         wkalarm.enable = RT_FALSE;
+    }
 
-    wkalarm.tm_sec = alarm->wktime.tm_sec;
-    wkalarm.tm_min = alarm->wktime.tm_min;
-    wkalarm.tm_hour = alarm->wktime.tm_hour;
-    wkalarm.tm_mday = alarm->wktime.tm_mday;
-    wkalarm.tm_mon = alarm->wktime.tm_mon;
-    wkalarm.tm_year = alarm->wktime.tm_year;
+    gmtime_r(&alarm->timestamp, &wktime);
+    wkalarm.tm_sec  = wktime.tm_sec;
+    wkalarm.tm_min  = wktime.tm_min;
+    wkalarm.tm_hour = wktime.tm_hour;
+    wkalarm.tm_mday = wktime.tm_mday;
+    wkalarm.tm_mon  = wktime.tm_mon;
+    wkalarm.tm_year = wktime.tm_year;
 
     ret = rt_device_control(device, RT_DEVICE_CTRL_RTC_SET_ALARM, &wkalarm);
     if ((ret == RT_EOK) && wkalarm.enable)
@@ -71,229 +177,64 @@ static rt_err_t alarm_set(struct rt_alarm *alarm)
               some RTC device like RX8025,it's alarms precision is 1 minute.
               in this case,low level RTC driver should set wkalarm->tm_sec to 0.
             */
-            alarm->wktime.tm_sec = wkalarm.tm_sec;
-            alarm->wktime.tm_min = wkalarm.tm_min;
-            alarm->wktime.tm_hour = wkalarm.tm_hour;
-            alarm->wktime.tm_mday = wkalarm.tm_mday;
-            alarm->wktime.tm_mon = wkalarm.tm_mon;
-            alarm->wktime.tm_year = wkalarm.tm_year;
+            alarm->wktime.tm_sec   = wkalarm.tm_sec;
+            alarm->wktime.tm_min   = wkalarm.tm_min;
+            alarm->wktime.tm_hour  = wkalarm.tm_hour;
+            alarm->wktime.tm_mday  = wkalarm.tm_mday;
+            alarm->wktime.tm_mon   = wkalarm.tm_mon;
+            alarm->wktime.tm_year  = wkalarm.tm_year;
+            alarm->timestamp = timegm(&wktime);
         }
     }
 
     return (ret);
 }
 
-static void alarm_wakeup(struct rt_alarm *alarm, struct tm *now)
-{
-    rt_uint32_t sec_alarm, sec_now;
-    rt_bool_t wakeup = RT_FALSE;
-    time_t timestamp;
-
-    sec_alarm = alarm_mkdaysec(&alarm->wktime);
-    sec_now = alarm_mkdaysec(now);
-
-    if (alarm->flag & RT_ALARM_STATE_START)
-    {
-        switch (alarm->flag & 0xFF00)
-        {
-        case RT_ALARM_ONESHOT:
-        {
-            sec_alarm = timegm(&alarm->wktime);
-            sec_now = timegm(now);
-            if (((sec_now - sec_alarm) <= RT_ALARM_DELAY) && (sec_now >= sec_alarm))
-            {
-                /* stop alarm */
-                alarm->flag &= ~RT_ALARM_STATE_START;
-                alarm_set(alarm);
-                wakeup = RT_TRUE;
-            }
-        }
-        break;
-        case RT_ALARM_SECOND:
-        {
-            alarm->wktime.tm_hour = now->tm_hour;
-            alarm->wktime.tm_min = now->tm_min;
-            alarm->wktime.tm_sec = now->tm_sec + 1;
-            if (alarm->wktime.tm_sec > 59)
-            {
-                alarm->wktime.tm_sec = 0;
-                alarm->wktime.tm_min = alarm->wktime.tm_min + 1;
-                if (alarm->wktime.tm_min > 59)
-                {
-                    alarm->wktime.tm_min = 0;
-                    alarm->wktime.tm_hour = alarm->wktime.tm_hour + 1;
-                    if (alarm->wktime.tm_hour > 23)
-                    {
-                        alarm->wktime.tm_hour = 0;
-                    }
-                }
-            }
-            wakeup = RT_TRUE;
-        }
-        break;
-        case RT_ALARM_MINUTE:
-        {
-            alarm->wktime.tm_hour = now->tm_hour;
-            if (alarm->wktime.tm_sec == now->tm_sec)
-            {
-                alarm->wktime.tm_min = now->tm_min + 1;
-                if (alarm->wktime.tm_min > 59)
-                {
-                    alarm->wktime.tm_min = 0;
-                    alarm->wktime.tm_hour = alarm->wktime.tm_hour + 1;
-                    if (alarm->wktime.tm_hour > 23)
-                    {
-                        alarm->wktime.tm_hour = 0;
-                    }
-                }
-                wakeup = RT_TRUE;
-            }
-        }
-        break;
-        case RT_ALARM_HOUR:
-        {
-            if ((alarm->wktime.tm_min == now->tm_min) &&
-                (alarm->wktime.tm_sec == now->tm_sec))
-            {
-                alarm->wktime.tm_hour = now->tm_hour + 1;
-                if (alarm->wktime.tm_hour > 23)
-                {
-                    alarm->wktime.tm_hour = 0;
-                }
-                wakeup = RT_TRUE;
-            }
-        }
-        break;
-        case RT_ALARM_DAILY:
-        {
-            if (((sec_now - sec_alarm) <= RT_ALARM_DELAY) && (sec_now >= sec_alarm))
-                wakeup = RT_TRUE;
-        }
-        break;
-        case RT_ALARM_WEEKLY:
-        {
-            /* alarm at wday */
-            if (alarm->wktime.tm_wday == now->tm_wday)
-            {
-                sec_alarm += alarm->wktime.tm_wday * 24 * 3600;
-                sec_now += now->tm_wday * 24 * 3600;
-
-                if (sec_now == sec_alarm)
-                    wakeup = RT_TRUE;
-            }
-        }
-        break;
-        case RT_ALARM_MONTHLY:
-        {
-            /* monthly someday generate alarm signals */
-            if (alarm->wktime.tm_mday == now->tm_mday)
-            {
-                if ((sec_now - sec_alarm) <= RT_ALARM_DELAY)
-                    wakeup = RT_TRUE;
-            }
-        }
-        break;
-        case RT_ALARM_YAERLY:
-        {
-            if ((alarm->wktime.tm_mday == now->tm_mday) && \
-                    (alarm->wktime.tm_mon == now->tm_mon))
-            {
-                if ((sec_now - sec_alarm) <= RT_ALARM_DELAY)
-                    wakeup = RT_TRUE;
-            }
-        }
-        break;
-        }
-
-        if ((wakeup == RT_TRUE) && (alarm->callback != RT_NULL))
-        {
-            timestamp = (time_t)0;
-            get_timestamp(&timestamp);
-            alarm->callback(alarm, timestamp);
-        }
-    }
-}
-
 static void alarm_update(rt_uint32_t event)
 {
-    struct rt_alarm *alm_prev = RT_NULL, *alm_next = RT_NULL;
-    struct rt_alarm *alarm;
-    rt_int32_t sec_now, sec_alarm, sec_tmp;
-    rt_int32_t sec_next = 24 * 3600, sec_prev = 0;
-    time_t timestamp = (time_t)0;
-    struct tm now;
-    rt_list_t *next;
-
+    rt_alarm_t cur = RT_NULL;
     rt_mutex_take(&_container.mutex, RT_WAITING_FOREVER);
-    if (!rt_list_isempty(&_container.head))
+
+    time_t old =  get_timer_context();
+    time_t now =  set_timer_context();
+    time_t delta = now  - old; /*intentional wrap around */
+    
+    /* update timeStamp based upon new Time Reference*/
+    /* because delta context should never exceed 2^32*/
+    if (_container.head != RT_NULL)
     {
-        /* get time of now */
-        get_timestamp(&timestamp);
-        gmtime_r(&timestamp, &now);
-
-        for (next = _container.head.next; next != &_container.head; next = next->next)
-        {
-            alarm = rt_list_entry(next, struct rt_alarm, list);
-            /* check the overtime alarm */
-            alarm_wakeup(alarm, &now);
-        }
-
-        /* get time of now */
-        get_timestamp(&timestamp);
-        gmtime_r(&timestamp, &now);
-        sec_now = alarm_mkdaysec(&now);
-
-        for (next = _container.head.next; next != &_container.head; next = next->next)
-        {
-            alarm = rt_list_entry(next, struct rt_alarm, list);
-            /* calculate seconds from 00:00:00 */
-            sec_alarm = alarm_mkdaysec(&alarm->wktime);
-            if (alarm->flag & RT_ALARM_STATE_START)
+        cur = _container.head;
+        do {
+            if (cur->timestamp > delta)
             {
-                sec_tmp = sec_alarm - sec_now;
-                if (sec_tmp > 0)
-                {
-                    /* find alarm after now(now to 23:59:59) and the most recent */
-                    if (sec_tmp < sec_next)
-                    {
-                        sec_next = sec_tmp;
-                        alm_next = alarm;
-                    }
-                }
-                else
-                {
-                    /* find alarm before now(00:00:00 to now) and furthest from now */
-                    if (sec_tmp < sec_prev)
-                    {
-                        sec_prev = sec_tmp;
-                        alm_prev = alarm;
-                    }
-                }
+                cur->timestamp -= delta;
             }
-        }
-
-        /* enable the alarm after now first */
-        if (sec_next < 24 * 3600)
-        {
-            if (alarm_set(alm_next) == RT_EOK)
-                _container.current = alm_next;
-        }
-        else if (sec_prev < 0)
-        {
-            /* enable the alarm before now */
-            if (alarm_set(alm_prev) == RT_EOK)
-                _container.current = alm_prev;
-        }
-        else
-        {
-            if (_container.current != RT_NULL)
+            else
             {
-                alarm_set(_container.current);
-                if (!(_container.current->flag & RT_ALARM_STATE_START))
-                    _container.current = RT_NULL;
+                cur->timestamp = 0;
             }
-        }
+            cur = cur->next;
+        } while(cur != RT_NULL);
     }
+
+    /* Execute expired timer and update the list, prevent lost processing due to increased timestamps */
+    while ((_container.head != RT_NULL) && ((_container.head->timestamp == 0U) || (_container.head->timestamp < get_elapsed_time())))
+    {
+        cur = _container.head;
+        _container.head = _container.head->next;
+        if (alarm->callback != RT_NULL)
+        {
+            alarm->callback(alarm, timestamp);
+        }
+        rt_alarm_start(cur);
+    }
+
+    /* start the next _container.head if it exists and it is not pending*/
+    if(( _container.head != RT_NULL) && (_container.head->flag & RT_ALARM_STATE_START))
+    {
+        set_timeout(_container.head);
+    }
+
     rt_mutex_release(&_container.mutex);
 }
 
@@ -484,8 +425,6 @@ static rt_err_t alarm_setup(rt_alarm_t alarm, struct tm *wktime)
         */
         setup->tm_sec = 60 - RT_ALARM_DELAY;
     }
-    /* set initialized state */
-    alarm->flag |= RT_ALARM_STATE_INITED;
     ret = RT_EOK;
 
 _exit:
@@ -501,7 +440,7 @@ _exit:
  */
 void rt_alarm_update(rt_device_t dev, rt_uint32_t event)
 {
-    rt_event_send(&_container.event, 1);
+    rt_event_send(&_container.event, event);
 }
 
 /** \brief modify the alarm setup
@@ -545,13 +484,13 @@ rt_err_t rt_alarm_control(rt_alarm_t alarm, int cmd, void *arg)
  */
 rt_err_t rt_alarm_start(rt_alarm_t alarm)
 {
-    rt_int32_t sec_now, sec_old, sec_new;
     rt_err_t ret = RT_EOK;
-    time_t timestamp = (time_t)0;
-    struct tm now;
 
     if (alarm == RT_NULL)
-        return (RT_ERROR);
+    {
+        return -RT_ERROR;
+    }
+
     rt_mutex_take(&_container.mutex, RT_WAITING_FOREVER);
 
     if (!(alarm->flag & RT_ALARM_STATE_START))
@@ -562,52 +501,33 @@ rt_err_t rt_alarm_start(rt_alarm_t alarm)
             goto _exit;
         }
 
-        /* get time of now */
-        get_timestamp(&timestamp);
-        gmtime_r(&timestamp, &now);
-
+        alarm->flag &= ~RT_ALARM_STATE_STOP;
         alarm->flag |= RT_ALARM_STATE_START;
+        alarm->timestamp = timegm(setup.wktime);
 
-        /* set alarm */
-        if (_container.current == RT_NULL)
+        if(_container.head == RT_NULL)
         {
-            ret = alarm_set(alarm);
+            set_timer_context();
+            insert_new_head_timer(alarm);
         }
         else
         {
-            sec_now = alarm_mkdaysec(&now);
-            sec_old = alarm_mkdaysec(&_container.current->wktime);
-            sec_new = alarm_mkdaysec(&alarm->wktime);
-
-            if ((sec_new < sec_old) && (sec_new > sec_now))
+            alarm->timestamp += get_elapsed_time();
+            if(alarm->timestamp < _container.head->setup.timestamp)
             {
-                ret = alarm_set(alarm);
-            }
-            else if ((sec_new > sec_now) && (sec_old < sec_now))
-            {
-                ret = alarm_set(alarm);
-            }
-            else if ((sec_new < sec_old) && (sec_old < sec_now))
-            {
-                ret = alarm_set(alarm);
+                insert_new_head_timer(alarm);
             }
             else
             {
-                ret = RT_EOK;
-                goto _exit;
+                insert_timer(alarm);
             }
-        }
-
-        if (ret == RT_EOK)
-        {
-            _container.current = alarm;
         }
     }
 
 _exit:
     rt_mutex_release(&_container.mutex);
 
-    return (ret);
+    return ret;
 }
 
 /** \brief stop an alarm
@@ -620,26 +540,70 @@ rt_err_t rt_alarm_stop(rt_alarm_t alarm)
     rt_err_t ret = RT_EOK;
 
     if (alarm == RT_NULL)
-        return (RT_ERROR);
-    rt_mutex_take(&_container.mutex, RT_WAITING_FOREVER);
-    if (!(alarm->flag & RT_ALARM_STATE_START))
-        goto _exit;
-    /* stop alarm */
-    alarm->flag &= ~RT_ALARM_STATE_START;
-
-    if (_container.current == alarm)
     {
-        ret = alarm_set(alarm);
-        _container.current = RT_NULL;
+        return -RT_ERROR;
     }
 
-    if (ret == RT_EOK)
-        alarm_update(0);
+    rt_mutex_take(&_container.mutex, RT_WAITING_FOREVER);
+
+    if (!(alarm->flag & RT_ALARM_STATE_START))
+    {
+        goto _exit;
+    }
+
+    /* stop alarm */
+    alarm->flag &= ~RT_ALARM_STATE_START;
+    alarm->flag |= RT_ALARM_STATE_STOP;
+
+    rt_alarm_t prev = _container.head;
+    rt_alarm_t cur  = _container.head;
+    /* List is empty or the Obj to stop does not exist  */
+    if(RT_NULL != _container.head)
+    {
+        if(_container.head == &alarm->setup) /* Stop the Head */
+        {
+            if(_container.head->next != RT_NULL)
+            {
+                _container.head = _container.head->next;
+                set_timeout();
+            }
+            else
+            {
+                ret = stop_timer(alarm);
+                _container.head = RT_NULL;
+            }
+        }
+        else /* Stop an object within the list */
+        {
+            while(cur != RT_NULL)
+            {
+                if(cur == &alarm->setup)
+                {
+                    if( cur->next != RT_NULL )
+                    {
+                        cur = cur->next;
+                        prev->next = cur;
+                    }
+                    else
+                    {
+                        cur = RT_NULL;
+                        prev->next = cur;
+                    }
+                    break;
+                }
+                else
+                {
+                    prev = cur;
+                    cur = cur->next;
+                }
+            }
+        }
+    }
 
 _exit:
     rt_mutex_release(&_container.mutex);
 
-    return (ret);
+    return ret;
 }
 
 /** \brief delete an alarm
@@ -652,23 +616,24 @@ rt_err_t rt_alarm_delete(rt_alarm_t alarm)
     rt_err_t ret = RT_EOK;
 
     if (alarm == RT_NULL)
-        return -RT_ERROR;
-    rt_mutex_take(&_container.mutex, RT_WAITING_FOREVER);
-    /* stop the alarm */
-    alarm->flag &= ~RT_ALARM_STATE_START;
-    if (_container.current == alarm)
     {
-        ret = alarm_set(alarm);
-        _container.current = RT_NULL;
-        /* set new alarm if necessary */
-        alarm_update(0);
+        return -RT_ERROR;
     }
-    rt_list_remove(&alarm->list);
-    rt_free(alarm);
+
+    rt_mutex_take(&_container.mutex, RT_WAITING_FOREVER);
+
+    ret = rt_alarm_stop(alarm);
+
+    alarm->flag &= ~RT_ALARM_STATE_INITED;
+
+    if(ret == RT_EOK)
+    {
+        rt_free(alarm);
+    }
 
     rt_mutex_release(&_container.mutex);
 
-    return (ret);
+    return ret;
 }
 
 /** \brief create an alarm
@@ -678,35 +643,35 @@ rt_err_t rt_alarm_delete(rt_alarm_t alarm)
  */
 rt_alarm_t rt_alarm_create(rt_alarm_callback_t callback, struct rt_alarm_setup *setup)
 {
-    struct rt_alarm *alarm;
-
     if (setup == RT_NULL)
-        return (RT_NULL);
+    {
+        return RT_NULL;
+    }
 
-    alarm = rt_malloc(sizeof(struct rt_alarm));
+    rt_alarm_t alarm = rt_malloc(sizeof(struct rt_alarm));
     if (alarm == RT_NULL)
-        return (RT_NULL);
-
-    rt_list_init(&alarm->list);
+    {
+        return RT_NULL;
+    }
 
     alarm->wktime = setup->wktime;
+    alarm->timestamp = timegm(setup.wktime);
     alarm->flag = setup->flag & 0xFF00;
+    /* set initialized state */
+    alarm->flag |= RT_ALARM_STATE_INITED;
     alarm->callback = callback;
-    rt_mutex_take(&_container.mutex, RT_WAITING_FOREVER);
-    rt_list_insert_after(&_container.head, &alarm->list);
-    rt_mutex_release(&_container.mutex);
 
-    return (alarm);
+    return alarm;
 }
 
 /** \brief rtc alarm service thread entry
  *
  */
-static void rt_alarmsvc_thread_init(void *param)
+static void rt_alarmsvc_thread(void *param)
 {
     rt_uint32_t recv;
 
-    _container.current = RT_NULL;
+    _container.head = RT_NULL;
 
     while (1)
     {
@@ -756,20 +721,18 @@ static rt_uint8_t get_alarm_flag_index(rt_uint32_t alarm_flag)
 
 void rt_alarm_dump(void)
 {
-    rt_list_t *next;
-    rt_alarm_t alarm;
+    rt_alarm_t node;
 
-    rt_kprintf("| hh:mm:ss | week | flag | en |\n");
-    rt_kprintf("+----------+------+------+----+\n");
-    for (next = _container.head.next; next != &_container.head; next = next->next)
+    rt_kprintf("| hh:mm:ss | week | flag | en | timestamp |\n");
+    rt_kprintf("+----------+------+------+----+-----------+\n");
+    for (node = _container.head.next; node != &_container.head; node = node->next)
     {
-        alarm = rt_list_entry(next, struct rt_alarm, list);
-        rt_uint8_t flag_index = get_alarm_flag_index(alarm->flag);
-        rt_kprintf("| %02d:%02d:%02d |  %2d  |  %2s  | %2d |\n",
+        rt_uint8_t flag_index = get_alarm_flag_index(node->flag);
+        rt_kprintf("| %02d:%02d:%02d |  %2d  |  %2s  | %2d | %d |\n",
             alarm->wktime.tm_hour, alarm->wktime.tm_min, alarm->wktime.tm_sec,
-            alarm->wktime.tm_wday, _alarm_flag_tbl[flag_index].name, alarm->flag & RT_ALARM_STATE_START);
+            alarm->wktime.tm_wday, _alarm_flag_tbl[flag_index].name, alarm->flag & RT_ALARM_STATE_START, alarm->timestamp);
     }
-    rt_kprintf("+----------+------+------+----+\n");
+    rt_kprintf("+----------+------+------+----+-----------+\n");
 }
 
 MSH_CMD_EXPORT_ALIAS(rt_alarm_dump, list_alarm, list alarm info);
@@ -783,15 +746,16 @@ int rt_alarm_system_init(void)
 {
     rt_thread_t tid;
 
-    rt_list_init(&_container.head);
     rt_event_init(&_container.event, "alarmsvc", RT_IPC_FLAG_FIFO);
     rt_mutex_init(&_container.mutex, "alarmsvc", RT_IPC_FLAG_PRIO);
 
     tid = rt_thread_create("alarmsvc",
-                           rt_alarmsvc_thread_init, RT_NULL,
-                           2048, 10, 5);
+                           rt_alarmsvc_thread, RT_NULL,
+                           ALARM_STACK_SIZE, ALARM_PRIORITY, ALARM_TICKS);
     if (tid != RT_NULL)
+    {
         rt_thread_startup(tid);
+    }
 
     return 0;
 }

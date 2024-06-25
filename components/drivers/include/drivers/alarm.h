@@ -41,26 +41,18 @@ typedef void (*rt_alarm_callback_t)(rt_alarm_t alarm, time_t timestamp);
 
 struct rt_alarm
 {
-    rt_list_t list;
+    struct rt_alarm *next;
     rt_uint32_t flag;
     rt_alarm_callback_t callback;
     struct tm wktime;
-
     void *user_data;
+    time_t timestamp;
 };
 
 struct rt_alarm_setup
 {
     rt_uint32_t flag;                /* alarm flag */
     struct tm wktime;                /* when will the alarm wake up user */
-};
-
-struct rt_alarm_container
-{
-    rt_list_t head;
-    struct rt_mutex mutex;
-    struct rt_event event;
-    struct rt_alarm *current;
 };
 
 rt_alarm_t rt_alarm_create(rt_alarm_callback_t    callback,
