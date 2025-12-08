@@ -458,45 +458,35 @@ static rt_ssize_t spixfer(struct rt_spi_device *device, struct rt_spi_message *m
             LOG_E("message->send_buf and message->recv_buf are both NULL!");
         }
 
-        if (state != HAL_OK)
+        if (state == HAL_OK)
         {
-            LOG_E("SPI transfer error: %d", state);
-            message->length = 0;
-            spi_handle->State = HAL_SPI_STATE_READY;
-            break;
-        }
-        else
-        {
-            LOG_D("%s transfer done", spi_drv->config->bus_name);
-        }
-
-        if (use_tx_dma || use_rx_dma)
-        {
-            /* blocking the thread,and the other tasks can run */
-            if (rt_completion_wait(&spi_drv->cpt, timeout_ms) != RT_EOK)
+            if (use_tx_dma || use_rx_dma)
             {
-                state = HAL_ERROR;
-                LOG_E("wait for DMA interrupt overtime!");
-                HAL_SPI_DMAStop(spi_handle);
-                break;
-            }
-        }
-        else
-        {
-            if (rt_scheduler_is_available())
-            {
-                rt_uint32_t timeout = timeout_ms;
-                while (HAL_SPI_GetState(spi_handle) != HAL_SPI_STATE_READY)
+                /* blocking the thread,and the other tasks can run */
+                if (rt_completion_wait(&spi_drv->cpt, rt_tick_from_millisecond(timeout_ms)) != RT_EOK)
                 {
-                    if(timeout-- > 0)
+                    state = HAL_ERROR;
+                    LOG_E("wait for DMA interrupt overtime!");
+                    HAL_SPI_DMAStop(spi_handle);
+                }
+            }
+            else
+            {
+                if (rt_scheduler_is_available())
+                {
+                    rt_uint32_t timeout = timeout_ms;
+                    while (HAL_SPI_GetState(spi_handle) != HAL_SPI_STATE_READY)
                     {
-                        rt_thread_mdelay(1);
-                    }
-                    else
-                    {
-                        LOG_E("timeout! SPI state did not become READY.");
-                        state = HAL_TIMEOUT;
-                        break;
+                        if(timeout-- > 0)
+                        {
+                            rt_thread_mdelay(1);
+                        }
+                        else
+                        {
+                            LOG_E("timeout! SPI state did not become READY.");
+                            state = HAL_TIMEOUT;
+                            break;
+                        }
                     }
                 }
             }
@@ -512,11 +502,24 @@ static rt_ssize_t spixfer(struct rt_spi_device *device, struct rt_spi_message *m
 #endif
                 rt_memcpy(recv_buf, aligned_recv_buf, send_length);
             }
+
+            LOG_D("%s transfer done", spi_drv->config->bus_name);
+        }
+        else
+        {
+            LOG_E("SPI transfer error: %d", state);
+            message->length = 0;
+            spi_handle->State = HAL_SPI_STATE_READY;
         }
 
         // Free any temporary buffers that were allocated
         if (aligned_send_buf) rt_free_align(aligned_send_buf);
         if (aligned_recv_buf) rt_free_align(aligned_recv_buf);
+
+        if (state != HAL_OK)
+        {
+            break;
+        }
     }
 
     if (message->cs_release && !(device->config.mode & RT_SPI_NO_CS) && (device->cs_pin != PIN_NONE))
