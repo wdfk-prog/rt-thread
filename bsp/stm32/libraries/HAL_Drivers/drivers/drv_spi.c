@@ -306,6 +306,7 @@ static rt_ssize_t spixfer(struct rt_spi_device *device, struct rt_spi_message *m
     }
 
     rt_uint32_t timeout_ms = total_byte_ms / speed_bytes_per_sec + 100;
+    rt_tick_t timeout_ticks = rt_tick_from_millisecond(timeout_ms);
 
     if (message->cs_take && !(device->config.mode & RT_SPI_NO_CS) && (device->cs_pin != PIN_NONE))
     {
@@ -330,6 +331,7 @@ static rt_ssize_t spixfer(struct rt_spi_device *device, struct rt_spi_message *m
     send_buf = message->send_buf;
     while (message_length)
     {
+        state = HAL_OK;
         /* the HAL library use uint16 to save the data length */
         if (message_length > 65535)
         {
@@ -384,7 +386,7 @@ static rt_ssize_t spixfer(struct rt_spi_device *device, struct rt_spi_message *m
                 {
                     state = HAL_ERROR;
                     LOG_E("malloc aligned_send_buf failed!");
-                    break;
+                    goto transfer_cleanup;
                 }
                 rt_memcpy(aligned_send_buf, send_buf, send_length);
                 dma_send_buf = aligned_send_buf;
@@ -397,7 +399,7 @@ static rt_ssize_t spixfer(struct rt_spi_device *device, struct rt_spi_message *m
                 {
                     state = HAL_ERROR;
                     LOG_E("malloc aligned_recv_buf failed!");
-                    break;
+                    goto transfer_cleanup;
                 }
                 dma_recv_buf = aligned_recv_buf;
             }
@@ -463,7 +465,7 @@ static rt_ssize_t spixfer(struct rt_spi_device *device, struct rt_spi_message *m
             if (use_tx_dma || use_rx_dma)
             {
                 /* blocking the thread,and the other tasks can run */
-                if (rt_completion_wait(&spi_drv->cpt, rt_tick_from_millisecond(timeout_ms)) != RT_EOK)
+                if (rt_completion_wait(&spi_drv->cpt, timeout_ticks) != RT_EOK)
                 {
                     state = HAL_ERROR;
                     LOG_E("wait for DMA interrupt overtime!");
@@ -492,6 +494,7 @@ static rt_ssize_t spixfer(struct rt_spi_device *device, struct rt_spi_message *m
             }
         }
 
+transfer_cleanup:
         /* Post-transfer processing */
         if (state == HAL_OK)
         {
@@ -512,7 +515,7 @@ static rt_ssize_t spixfer(struct rt_spi_device *device, struct rt_spi_message *m
             spi_handle->State = HAL_SPI_STATE_READY;
         }
 
-        // Free any temporary buffers that were allocated
+        /* Free any temporary buffers that were allocated */
         if (aligned_send_buf) rt_free_align(aligned_send_buf);
         if (aligned_recv_buf) rt_free_align(aligned_recv_buf);
 
