@@ -306,6 +306,7 @@ static rt_ssize_t spixfer(struct rt_spi_device *device, struct rt_spi_message *m
     }
 
     rt_uint32_t timeout_ms = total_byte_ms / speed_bytes_per_sec + 100;
+    rt_tick_t timeout_ticks = rt_tick_from_millisecond(timeout_ms);
 
     if (message->cs_take && !(device->config.mode & RT_SPI_NO_CS) && (device->cs_pin != PIN_NONE))
     {
@@ -330,6 +331,7 @@ static rt_ssize_t spixfer(struct rt_spi_device *device, struct rt_spi_message *m
     send_buf = message->send_buf;
     while (message_length)
     {
+        state = HAL_OK;
         /* the HAL library use uint16 to save the data length */
         if (message_length > 65535)
         {
@@ -384,10 +386,12 @@ static rt_ssize_t spixfer(struct rt_spi_device *device, struct rt_spi_message *m
                 {
                     state = HAL_ERROR;
                     LOG_E("malloc aligned_send_buf failed!");
-                    break;
                 }
-                rt_memcpy(aligned_send_buf, send_buf, send_length);
-                dma_send_buf = aligned_send_buf;
+                else
+                {
+                    rt_memcpy(aligned_send_buf, send_buf, send_length);
+                    dma_send_buf = aligned_send_buf;
+                }
             }
 
             if (recv_buf && use_rx_dma && !RT_IS_ALIGN((rt_uint32_t)recv_buf, align_size))
@@ -397,9 +401,11 @@ static rt_ssize_t spixfer(struct rt_spi_device *device, struct rt_spi_message *m
                 {
                     state = HAL_ERROR;
                     LOG_E("malloc aligned_recv_buf failed!");
-                    break;
                 }
-                dma_recv_buf = aligned_recv_buf;
+                else
+                {
+                    dma_recv_buf = aligned_recv_buf;
+                }
             }
 
 #if defined(SOC_SERIES_STM32H7) || defined(SOC_SERIES_STM32F7)
@@ -409,100 +415,92 @@ static rt_ssize_t spixfer(struct rt_spi_device *device, struct rt_spi_message *m
 #endif
         }
 
-        /* Start data exchange in full-duplex DMA mode. */
-        if (message->send_buf && message->recv_buf)
+        if (state == HAL_OK)
         {
-            if (use_tx_dma && use_rx_dma)
+            /* Start data exchange in full-duplex DMA mode. */
+            if (message->send_buf && message->recv_buf)
             {
-                state = HAL_SPI_TransmitReceive_DMA(spi_handle, (uint8_t *)dma_send_buf, dma_recv_buf, send_length);
+                if (use_tx_dma && use_rx_dma)
+                {
+                    state = HAL_SPI_TransmitReceive_DMA(spi_handle, (uint8_t *)dma_send_buf, dma_recv_buf, send_length);
+                }
+                else
+                {
+                    state = HAL_SPI_TransmitReceive(spi_handle, (uint8_t *)send_buf, recv_buf, send_length, timeout_ms);
+                }
+            }
+            else if (message->send_buf)
+            {
+                if (use_tx_dma)
+                {
+                    state = HAL_SPI_Transmit_DMA(spi_handle, (uint8_t *)dma_send_buf, send_length);
+                }
+                else
+                {
+                    state = HAL_SPI_Transmit(spi_handle, (uint8_t *)send_buf, send_length, timeout_ms);
+                }
+
+                if (message->cs_release && (device->config.mode & RT_SPI_3WIRE))
+                {
+                    /* release the CS by disable SPI when using 3 wires SPI */
+                    __HAL_SPI_DISABLE(spi_handle);
+                }
+            }
+            else if(message->recv_buf)
+            {
+                rt_memset(dma_recv_buf, 0xFF, send_length);
+                if (use_rx_dma)
+                {
+                    state = HAL_SPI_Receive_DMA(spi_handle, dma_recv_buf, send_length);
+                }
+                else
+                {
+                    /* clear the old error flag */
+                    __HAL_SPI_CLEAR_OVRFLAG(spi_handle);
+                    state = HAL_SPI_Receive(spi_handle, recv_buf, send_length, timeout_ms);
+                }
             }
             else
-            {
-                state = HAL_SPI_TransmitReceive(spi_handle, (uint8_t *)send_buf, recv_buf, send_length, timeout_ms);
-            }
-        }
-        else if (message->send_buf)
-        {
-            if (use_tx_dma)
-            {
-                state = HAL_SPI_Transmit_DMA(spi_handle, (uint8_t *)dma_send_buf, send_length);
-            }
-            else
-            {
-                state = HAL_SPI_Transmit(spi_handle, (uint8_t *)send_buf, send_length, timeout_ms);
-            }
-
-            if (message->cs_release && (device->config.mode & RT_SPI_3WIRE))
-            {
-                /* release the CS by disable SPI when using 3 wires SPI */
-                __HAL_SPI_DISABLE(spi_handle);
-            }
-        }
-        else if(message->recv_buf)
-        {
-            rt_memset(dma_recv_buf, 0xFF, send_length);
-            if (use_rx_dma)
-            {
-                state = HAL_SPI_Receive_DMA(spi_handle, dma_recv_buf, send_length);
-            }
-            else
-            {
-                /* clear the old error flag */
-                __HAL_SPI_CLEAR_OVRFLAG(spi_handle);
-                state = HAL_SPI_Receive(spi_handle, recv_buf, send_length, timeout_ms);
-            }
-        }
-        else
-        {
-            state = HAL_ERROR;
-            LOG_E("message->send_buf and message->recv_buf are both NULL!");
-        }
-
-        if (state != HAL_OK)
-        {
-            LOG_E("SPI transfer error: %d", state);
-            message->length = 0;
-            spi_handle->State = HAL_SPI_STATE_READY;
-            break;
-        }
-        else
-        {
-            LOG_D("%s transfer done", spi_drv->config->bus_name);
-        }
-
-        if (use_tx_dma || use_rx_dma)
-        {
-            /* blocking the thread,and the other tasks can run */
-            if (rt_completion_wait(&spi_drv->cpt, timeout_ms) != RT_EOK)
             {
                 state = HAL_ERROR;
-                LOG_E("wait for DMA interrupt overtime!");
-                HAL_SPI_DMAStop(spi_handle);
-                break;
+                LOG_E("message->send_buf and message->recv_buf are both NULL!");
             }
         }
-        else
+
+        if (state == HAL_OK)
         {
-            if (rt_scheduler_is_available())
+            if (use_tx_dma || use_rx_dma)
             {
-                rt_uint32_t timeout = timeout_ms;
-                while (HAL_SPI_GetState(spi_handle) != HAL_SPI_STATE_READY)
+                /* blocking the thread,and the other tasks can run */
+                if (rt_completion_wait(&spi_drv->cpt, timeout_ticks) != RT_EOK)
                 {
-                    if(timeout-- > 0)
+                    state = HAL_ERROR;
+                    LOG_E("wait for DMA interrupt overtime!");
+                    HAL_SPI_DMAStop(spi_handle);
+                }
+            }
+            else
+            {
+                if (rt_scheduler_is_available())
+                {
+                    rt_uint32_t timeout = timeout_ms;
+                    while (HAL_SPI_GetState(spi_handle) != HAL_SPI_STATE_READY)
                     {
-                        rt_thread_mdelay(1);
-                    }
-                    else
-                    {
-                        LOG_E("timeout! SPI state did not become READY.");
-                        state = HAL_TIMEOUT;
-                        break;
+                        if(timeout-- > 0)
+                        {
+                            rt_thread_mdelay(1);
+                        }
+                        else
+                        {
+                            LOG_E("timeout! SPI state did not become READY.");
+                            state = HAL_TIMEOUT;
+                            break;
+                        }
                     }
                 }
             }
         }
 
-        /* Post-transfer processing */
         if (state == HAL_OK)
         {
             if (aligned_recv_buf != RT_NULL)
@@ -512,11 +510,24 @@ static rt_ssize_t spixfer(struct rt_spi_device *device, struct rt_spi_message *m
 #endif
                 rt_memcpy(recv_buf, aligned_recv_buf, send_length);
             }
+
+            LOG_D("%s transfer done", spi_drv->config->bus_name);
+        }
+        else
+        {
+            LOG_E("SPI transfer error: %d", state);
+            message->length = 0;
+            spi_handle->State = HAL_SPI_STATE_READY;
         }
 
         // Free any temporary buffers that were allocated
         if (aligned_send_buf) rt_free_align(aligned_send_buf);
         if (aligned_recv_buf) rt_free_align(aligned_recv_buf);
+
+        if (state != HAL_OK)
+        {
+            break;
+        }
     }
 
     if (message->cs_release && !(device->config.mode & RT_SPI_NO_CS) && (device->cs_pin != PIN_NONE))
