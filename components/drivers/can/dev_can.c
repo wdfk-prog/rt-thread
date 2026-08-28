@@ -8,6 +8,7 @@
  * 2015-05-14     aubrcool@qq.com   first version
  * 2015-07-06     Bernard           code cleanup and remove RT_CAN_USING_LED;
  * 2025-09-20     wdfk_prog         Implemented non-blocking, ISR-safe send logic unified under rt_device_write.
+ * 2026-08-26     wdfk_prog         Add TX gate and full flush support.
  */
 
 #include <rthw.h>
@@ -16,6 +17,323 @@
 
 #define CAN_LOCK(can)   rt_mutex_take(&(can->lock), RT_WAITING_FOREVER)
 #define CAN_UNLOCK(can) rt_mutex_release(&(can->lock))
+
+enum rt_can_tx_state
+{
+    RT_CAN_TX_STATE_DISABLED = 0, /**< New TX submissions are rejected. */
+    RT_CAN_TX_STATE_ENABLED,      /**< New TX submissions are allowed. */
+    RT_CAN_TX_STATE_FLUSHING,     /**< An exclusive TX quiesce operation is in progress; new submissions are rejected. */
+};
+
+/**
+ * @brief Enter the TX submission critical section if the TX gate is open.
+ *
+ * The reference count is incremented before checking the gate. This ordering
+ * ensures that a concurrent flush either observes this sender in the reference
+ * count or causes the sender to observe the closed gate and back out without
+ * submitting to hardware or the software TX queue.
+ *
+ * @param[in] can A pointer to the CAN device.
+ * @return RT_TRUE if the caller may submit TX data, otherwise RT_FALSE.
+ */
+static rt_bool_t _can_tx_submit_begin(struct rt_can_device *can)
+{
+    rt_atomic_add(&can->tx_submit_refcnt, 1);
+
+    if (rt_atomic_load(&can->tx_state) != RT_CAN_TX_STATE_ENABLED)
+    {
+        rt_atomic_sub(&can->tx_submit_refcnt, 1);
+        return RT_FALSE;
+    }
+
+    return RT_TRUE;
+}
+
+/**
+ * @brief Leave the TX submission critical section.
+ *
+ * @param[in] can A pointer to the CAN device.
+ */
+static void _can_tx_submit_end(struct rt_can_device *can)
+{
+    rt_atomic_sub(&can->tx_submit_refcnt, 1);
+}
+
+/**
+ * @brief Open or close the framework TX admission gate.
+ *
+ * This function only controls admission of new TX submissions. It does not
+ * wait for an already active submission and does not abort hardware TX.
+ * Enabling TX is rejected while an exclusive TX quiesce operation is in progress.
+ * The caller must provide any required device-lifecycle serialization.
+ *
+ * @param[in] can     A pointer to the CAN device.
+ * @param[in] enabled RT_TRUE to enable new submissions, RT_FALSE to disable them.
+ * @return RT_EOK on success, or -RT_EBUSY when enabling during a quiesce operation.
+ */
+static rt_err_t _can_set_tx_enabled(struct rt_can_device *can, rt_bool_t enabled)
+{
+    rt_base_t expected;
+    rt_base_t desired = enabled ? RT_CAN_TX_STATE_ENABLED : RT_CAN_TX_STATE_DISABLED;
+
+    while (RT_TRUE)
+    {
+        expected = rt_atomic_load(&can->tx_state);
+
+        if (expected == RT_CAN_TX_STATE_FLUSHING)
+        {
+            return enabled ? -RT_EBUSY : RT_EOK;
+        }
+
+        if (expected == desired)
+        {
+            return RT_EOK;
+        }
+
+        if (rt_atomic_compare_exchange_strong(&can->tx_state, &expected, desired))
+        {
+            return RT_EOK;
+        }
+    }
+}
+
+/**
+ * @brief Wait until all TX submission critical sections have exited.
+ *
+ * @param[in] can     A pointer to the CAN device.
+ * @param[in] timeout Timeout in OS ticks, or RT_WAITING_FOREVER.
+ * @return RT_EOK when the reference count reaches zero, otherwise -RT_ETIMEOUT.
+ */
+static rt_err_t _can_wait_tx_submit_refcnt(struct rt_can_device *can, rt_int32_t timeout)
+{
+    rt_tick_t start_tick = rt_tick_get();
+
+    while (rt_atomic_load(&can->tx_submit_refcnt) != 0)
+    {
+        if (timeout == 0)
+        {
+            return -RT_ETIMEOUT;
+        }
+
+        if (timeout != RT_WAITING_FOREVER &&
+            (rt_tick_t)(rt_tick_get() - start_tick) >= (rt_tick_t)timeout)
+        {
+            return -RT_ETIMEOUT;
+        }
+
+        rt_thread_mdelay(1);
+    }
+
+    return RT_EOK;
+}
+
+/**
+ * @brief Wait until all active CAN write paths have released TX runtime resources.
+ *
+ * Unlike `tx_submit_refcnt`, this reference count spans the complete public
+ * write operation, including semaphore waits and blocking completion waits.
+ *
+ * @param[in] can     A pointer to the CAN device.
+ * @param[in] timeout Timeout in OS ticks, or RT_WAITING_FOREVER.
+ * @return RT_EOK when the reference count reaches zero, otherwise -RT_ETIMEOUT.
+ */
+static rt_err_t _can_wait_tx_active_refcnt(struct rt_can_device *can, rt_int32_t timeout)
+{
+    rt_tick_t start_tick = rt_tick_get();
+
+    while (rt_atomic_load(&can->tx_active_refcnt) != 0)
+    {
+        if (timeout == 0)
+        {
+            return -RT_ETIMEOUT;
+        }
+
+        if (timeout != RT_WAITING_FOREVER &&
+            (rt_tick_t)(rt_tick_get() - start_tick) >= (rt_tick_t)timeout)
+        {
+            return -RT_ETIMEOUT;
+        }
+
+        rt_thread_mdelay(1);
+    }
+
+    return RT_EOK;
+}
+
+/**
+ * @brief Retire framework blocking TX ownership after hardware TX is quiescent.
+ *
+ * Active blocking senders are completed with ABORT. A normal-mode sender which
+ * previously timed out left ERR together with `sndchange` ownership and has no
+ * thread left to return its slot, so that slot is reclaimed here instead.
+ *
+ * @param[in] can A pointer to the CAN device.
+ */
+static void _can_retire_blocking_tx(struct rt_can_device *can)
+{
+    struct rt_can_tx_fifo *tx_fifo;
+    rt_uint32_t wake_mask = 0;
+    rt_uint32_t release_mask = 0;
+    rt_base_t level;
+    rt_uint32_t i;
+
+    tx_fifo = (struct rt_can_tx_fifo *)can->can_tx;
+    if (tx_fifo == RT_NULL)
+    {
+        return;
+    }
+
+    level = rt_hw_local_irq_disable();
+    for (i = 0; i < can->config.sndboxnumber && i < 32; i++)
+    {
+        if ((can->status.sndchange & (1UL << i)) == 0)
+        {
+            continue;
+        }
+
+        if (tx_fifo->buffer[i].result == RT_CAN_SND_RESULT_WAIT)
+        {
+            tx_fifo->buffer[i].result = RT_CAN_SND_RESULT_ABORT;
+            can->status.sndchange &= ~(1UL << i);
+            wake_mask |= (1UL << i);
+        }
+        else if (tx_fifo->buffer[i].result == RT_CAN_SND_RESULT_ERR)
+        {
+            tx_fifo->buffer[i].result = RT_CAN_SND_RESULT_ABORT;
+            can->status.sndchange &= ~(1UL << i);
+            if (rt_list_isempty(&tx_fifo->buffer[i].list))
+            {
+                rt_list_insert_before(&tx_fifo->freelist, &tx_fifo->buffer[i].list);
+                release_mask |= (1UL << i);
+            }
+        }
+    }
+    rt_hw_local_irq_enable(level);
+
+    for (i = 0; i < can->config.sndboxnumber && i < 32; i++)
+    {
+        if ((release_mask & (1UL << i)) != 0)
+        {
+            rt_sem_release(&tx_fifo->sem);
+        }
+        if ((wake_mask & (1UL << i)) != 0)
+        {
+            rt_completion_done(&tx_fifo->buffer[i].completion);
+        }
+    }
+}
+
+/**
+ * @brief Fully quiesce CAN TX and leave the framework TX gate disabled.
+ *
+ * A full flush first closes the TX gate, waits for send paths that already
+ * crossed the gate, clears the non-blocking software queue, synchronously
+ * aborts pending hardware TX, and finally wakes any blocking senders whose
+ * transactions were aborted. The timeout is treated as one budget shared by
+ * submitter draining, hardware abort, and active writer draining.
+ *
+ * @note This function must be called from thread context.
+ *
+ * @param[in] can     A pointer to the CAN device.
+ * @param[in] timeout Timeout in OS ticks, or RT_WAITING_FOREVER.
+ * @return RT_EOK on success, or a negative error code on failure.
+ */
+static rt_err_t _can_flush_tx(struct rt_can_device *can, rt_int32_t timeout)
+{
+    struct rt_can_abort_tx_config abort_cfg;
+    rt_uint32_t queued_msgs = 0;
+    rt_base_t previous_state;
+    rt_tick_t start_tick;
+    rt_tick_t elapsed;
+    rt_base_t level;
+    rt_err_t result;
+    rt_int32_t remaining_timeout;
+
+    if (rt_interrupt_get_nest() > 0)
+    {
+        return -RT_EINVAL;
+    }
+
+    if (timeout < 0 && timeout != RT_WAITING_FOREVER)
+    {
+        return -RT_EINVAL;
+    }
+
+    previous_state = rt_atomic_exchange(&can->tx_state, RT_CAN_TX_STATE_FLUSHING);
+    if (previous_state == RT_CAN_TX_STATE_FLUSHING)
+    {
+        return -RT_EBUSY;
+    }
+
+    if (can->ops->abort_tx == RT_NULL)
+    {
+        rt_atomic_store(&can->tx_state, RT_CAN_TX_STATE_DISABLED);
+        return -RT_ENOSYS;
+    }
+
+    start_tick = rt_tick_get();
+
+    /*
+     * A sender increments tx_submit_refcnt before its final gate check. Once the
+     * state is FLUSHING, no new sender can submit, and waiting for this count
+     * to reach zero closes the race with send paths that crossed the old gate.
+     */
+    result = _can_wait_tx_submit_refcnt(can, timeout);
+    if (result != RT_EOK)
+    {
+        rt_atomic_store(&can->tx_state, RT_CAN_TX_STATE_DISABLED);
+        return result;
+    }
+
+    /* Drop all non-blocking messages which have not reached the controller. */
+    level = rt_hw_local_irq_disable();
+    queued_msgs = rt_ringbuffer_data_len(&can->nb_tx_rb) / sizeof(struct rt_can_msg);
+    rt_ringbuffer_reset(&can->nb_tx_rb);
+    can->status.dropedsndpkg += queued_msgs;
+    rt_hw_local_irq_enable(level);
+
+    abort_cfg.mailbox_mask = RT_CAN_TX_MAILBOX_ALL;
+    abort_cfg.timeout = timeout;
+    if (timeout != RT_WAITING_FOREVER)
+    {
+        elapsed = (rt_tick_t)(rt_tick_get() - start_tick);
+        abort_cfg.timeout = elapsed >= (rt_tick_t)timeout ? 0 : timeout - (rt_int32_t)elapsed;
+    }
+
+    result = can->ops->abort_tx(can, &abort_cfg);
+    if (result != RT_EOK)
+    {
+        /* Keep TX disabled after a partial flush. */
+        rt_atomic_store(&can->tx_state, RT_CAN_TX_STATE_DISABLED);
+        return result;
+    }
+
+    /* Hardware is now idle; retire all remaining framework blocking ownership. */
+    _can_retire_blocking_tx(can);
+
+    remaining_timeout = timeout;
+    if (timeout != RT_WAITING_FOREVER)
+    {
+        elapsed = (rt_tick_t)(rt_tick_get() - start_tick);
+        remaining_timeout = elapsed >= (rt_tick_t)timeout ? 0 : timeout - (rt_int32_t)elapsed;
+    }
+
+    /*
+     * Blocking writers may have been waiting on the mailbox semaphore before
+     * they reached the submission gate. Retirement wakes/cascades those waiters;
+     * keep the TX runtime alive until every public write path has returned.
+     */
+    result = _can_wait_tx_active_refcnt(can, remaining_timeout);
+    if (result != RT_EOK)
+    {
+        rt_atomic_store(&can->tx_state, RT_CAN_TX_STATE_DISABLED);
+        return result;
+    }
+
+    /* A full flush intentionally leaves the device quiesced. */
+    rt_atomic_store(&can->tx_state, RT_CAN_TX_STATE_DISABLED);
+    return RT_EOK;
+}
 
 static rt_err_t rt_can_init(struct rt_device *dev)
 {
@@ -174,34 +492,65 @@ rt_inline int _can_int_tx(struct rt_can_device *can, const struct rt_can_msg *da
         rt_base_t level;
         rt_uint32_t no;
         rt_uint32_t result;
+        rt_err_t send_result;
         struct rt_can_sndbxinx_list *tx_tosnd = RT_NULL;
 
-        rt_sem_take(&(tx_fifo->sem), RT_WAITING_FOREVER);
+        if (rt_sem_take(&(tx_fifo->sem), RT_WAITING_FOREVER) != RT_EOK)
+        {
+            goto err_ret;
+        }
+
         level = rt_hw_local_irq_disable();
         tx_tosnd = rt_list_entry(tx_fifo->freelist.next, struct rt_can_sndbxinx_list, list);
         RT_ASSERT(tx_tosnd != RT_NULL);
         rt_list_remove(&tx_tosnd->list);
         rt_hw_local_irq_enable(level);
 
+        if (!_can_tx_submit_begin(can))
+        {
+            goto release_mailbox;
+        }
+
         no = ((rt_ubase_t)tx_tosnd - (rt_ubase_t)tx_fifo->buffer) / sizeof(struct rt_can_sndbxinx_list);
+
+        /* Publish the reusable completion, result and ownership bit as one ISR-visible transaction. */
+        level = rt_hw_local_irq_disable();
         tx_tosnd->result = RT_CAN_SND_RESULT_WAIT;
         rt_completion_init(&tx_tosnd->completion);
-        can->status.sndchange |= 1<<no;
-        if (can->ops->sendmsg(can, data, no) != RT_EOK)
+        can->status.sndchange |= 1UL << no;
+        rt_hw_local_irq_enable(level);
+
+        send_result = can->ops->sendmsg(can, data, no);
+        _can_tx_submit_end(can);
+
+        if (send_result != RT_EOK)
         {
-            /* send failed. */
-            level = rt_hw_local_irq_disable();
-            rt_list_insert_before(&tx_fifo->freelist, &tx_tosnd->list);
-            rt_hw_local_irq_enable(level);
-            rt_sem_release(&(tx_fifo->sem));
-            goto err_ret;
+            goto abort_transaction;
         }
 
         if (rt_completion_wait(&(tx_tosnd->completion), RT_CANSND_MSG_TIMEOUT) != RT_EOK)
         {
+            /*
+             * A software timeout does not prove that hardware released the
+             * mailbox. If ownership is still pending, detach this sender by
+             * leaving sndchange set and marking ERR; the terminal ISR or full
+             * flush will reclaim the slot and release the semaphore later.
+             */
             level = rt_hw_local_irq_disable();
+            if ((can->status.sndchange & (1UL << no)) != 0 &&
+                tx_tosnd->result == RT_CAN_SND_RESULT_WAIT)
+            {
+                tx_tosnd->result = RT_CAN_SND_RESULT_ERR;
+                rt_hw_local_irq_enable(level);
+                goto err_ret;
+            }
+
+            /* A terminal IRQ or flush raced with the timeout; this sender still owns the software slot return. */
+            if (!rt_list_isempty(&tx_tosnd->list))
+            {
+                rt_list_remove(&tx_tosnd->list);
+            }
             rt_list_insert_before(&tx_fifo->freelist, &tx_tosnd->list);
-            can->status.sndchange &= ~ (1<<no);
             rt_hw_local_irq_enable(level);
             rt_sem_release(&(tx_fifo->sem));
             goto err_ret;
@@ -226,18 +575,57 @@ rt_inline int _can_int_tx(struct rt_can_device *can, const struct rt_can_msg *da
             data ++;
             msgs -= sizeof(struct rt_can_msg);
             if (!msgs) break;
+            continue;
         }
-        else
-        {
+
+        goto err_ret;
+
+abort_transaction:
+        level = rt_hw_local_irq_disable();
+        can->status.sndchange &= ~(1UL << no);
+        tx_tosnd->result = RT_CAN_SND_RESULT_ERR;
+        rt_list_insert_before(&tx_fifo->freelist, &tx_tosnd->list);
+        rt_hw_local_irq_enable(level);
+        rt_sem_release(&(tx_fifo->sem));
+        goto err_ret;
+
+release_mailbox:
+        level = rt_hw_local_irq_disable();
+        rt_list_insert_before(&tx_fifo->freelist, &tx_tosnd->list);
+        rt_hw_local_irq_enable(level);
+        rt_sem_release(&(tx_fifo->sem));
+
 err_ret:
-            level = rt_hw_local_irq_disable();
-            can->status.dropedsndpkg++;
-            rt_hw_local_irq_enable(level);
-            break;
-        }
+        level = rt_hw_local_irq_disable();
+        can->status.dropedsndpkg++;
+        rt_hw_local_irq_enable(level);
+        break;
     }
 
     return (size - msgs);
+}
+
+/**
+ * @brief Reset private-mode software ownership after hardware has stopped using a mailbox.
+ *
+ * This helper is only used after the hardware transaction is known to be no
+ * longer pending, such as a rejected send request or a terminal TX result.
+ * It does not signal the transaction completion object.
+ *
+ * @param[in] can     A pointer to the CAN device.
+ * @param[in] tx_fifo A pointer to the blocking TX FIFO.
+ * @param[in] no      The private hardware mailbox index.
+ */
+static void _can_priv_tx_reset(struct rt_can_device *can,
+                               struct rt_can_tx_fifo *tx_fifo,
+                               rt_uint32_t no)
+{
+    rt_base_t level;
+
+    level = rt_hw_local_irq_disable();
+    can->status.sndchange &= ~(1UL << no);
+    tx_fifo->buffer[no].result = RT_CAN_SND_RESULT_OK;
+    rt_hw_local_irq_enable(level);
 }
 
 /**
@@ -247,6 +635,12 @@ err_ret:
  * This is a specialized version of `_can_int_tx` where the target hardware mailbox
  * for each message is specified by the user in the `priv` field of the `rt_can_msg`
  * structure, rather than being acquired dynamically from a pool.
+ *
+ * @note Private mode does not serialize concurrent senders targeting the same
+ * hardware mailbox; callers must still serialize each mailbox. If a mailbox
+ * remains owned by a prior transaction, this blocking path waits for that
+ * transaction to retire and retries the gate/ownership checks. A software
+ * timeout does not itself release hardware ownership.
  *
  * @param[in] can   A pointer to the CAN device.
  * @param[in] data  A pointer to the source buffer of messages.
@@ -269,52 +663,91 @@ rt_inline int _can_int_tx_priv(struct rt_can_device *can, const struct rt_can_ms
 
     while (msgs)
     {
+        struct rt_can_sndbxinx_list *tx_slot;
+        rt_err_t send_result;
+
         no = data->priv;
         if (no >= can->config.sndboxnumber)
         {
             break;
         }
 
+        tx_slot = &tx_fifo->buffer[no];
+
+        if (!_can_tx_submit_begin(can))
+        {
+            break;
+        }
+
+        /* Wait for a busy private mailbox to retire, then retry all gate and ownership checks. */
         level = rt_hw_local_irq_disable();
-        if ((tx_fifo->buffer[no].result != RT_CAN_SND_RESULT_OK))
+        result = tx_slot->result;
+        if ((can->status.sndchange & (1UL << no)) != 0 ||
+            result == RT_CAN_SND_RESULT_WAIT)
         {
             rt_hw_local_irq_enable(level);
-
-            rt_completion_wait(&(tx_fifo->buffer[no].completion), RT_WAITING_FOREVER);
+            _can_tx_submit_end(can);
+            if (rt_completion_wait(&(tx_slot->completion), RT_WAITING_FOREVER) != RT_EOK)
+            {
+                break;
+            }
             continue;
         }
-        tx_fifo->buffer[no].result = RT_CAN_SND_RESULT_WAIT;
+
+        /* Reinitialize the reusable completion before publishing this transaction to the ISR. */
+        tx_slot->result = RT_CAN_SND_RESULT_WAIT;
+        rt_completion_init(&(tx_slot->completion));
+        can->status.sndchange |= 1UL << no;
         rt_hw_local_irq_enable(level);
 
-        can->status.sndchange |= 1<<no;
-        if (can->ops->sendmsg(can, data, no) != RT_EOK)
+        send_result = can->ops->sendmsg(can, data, no);
+        _can_tx_submit_end(can);
+
+        if (send_result != RT_EOK)
         {
-            continue;
+            _can_priv_tx_reset(can, tx_fifo, no);
+            break;
         }
 
-        if (rt_completion_wait(&(tx_fifo->buffer[no].completion), RT_CANSND_MSG_TIMEOUT) != RT_EOK)
+        if (rt_completion_wait(&(tx_slot->completion), RT_CANSND_MSG_TIMEOUT) != RT_EOK)
         {
-            can->status.sndchange &= ~ (1<<no);
-            continue;
-        }
-
-        result = tx_fifo->buffer[no].result;
-        if (result == RT_CAN_SND_RESULT_OK)
-        {
-            level = rt_hw_local_irq_disable();
-            can->status.sndpkg++;
-            rt_hw_local_irq_enable(level);
-            data ++;
-            msgs -= sizeof(struct rt_can_msg);
-            if (!msgs) break;
-        }
-        else
-        {
+            /*
+             * Hardware may still own this transaction. Preserve WAIT/sndchange so
+             * a late IRQ or a full flush can retire it before the mailbox is reused.
+             */
             level = rt_hw_local_irq_disable();
             can->status.dropedsndpkg++;
             rt_hw_local_irq_enable(level);
             break;
         }
+
+        level = rt_hw_local_irq_disable();
+        result = tx_slot->result;
+        rt_hw_local_irq_enable(level);
+
+        if (result == RT_CAN_SND_RESULT_OK)
+        {
+            level = rt_hw_local_irq_disable();
+            can->status.sndpkg++;
+            rt_hw_local_irq_enable(level);
+
+            data ++;
+            msgs -= sizeof(struct rt_can_msg);
+            if (!msgs) break;
+            continue;
+        }
+
+        if (result == RT_CAN_SND_RESULT_WAIT)
+        {
+            break;
+        }
+
+        _can_priv_tx_reset(can, tx_fifo, no);
+
+        level = rt_hw_local_irq_disable();
+        can->status.dropedsndpkg++;
+        rt_hw_local_irq_enable(level);
+        break;
     }
 
     return (size - msgs);
@@ -348,8 +781,14 @@ static rt_ssize_t _can_nonblocking_tx(struct rt_can_device *can, const struct rt
 
     while (sent_size < size)
     {
+        if (!_can_tx_submit_begin(can))
+        {
+            break;
+        }
+
         if (can->ops->sendmsg_nonblocking(can, pmsg) == RT_EOK)
         {
+            _can_tx_submit_end(can);
             pmsg++;
             sent_size += sizeof(struct rt_can_msg);
             continue;
@@ -360,6 +799,7 @@ static rt_ssize_t _can_nonblocking_tx(struct rt_can_device *can, const struct rt
         {
             rt_ringbuffer_put(&can->nb_tx_rb, (rt_uint8_t *)pmsg, sizeof(struct rt_can_msg));
             rt_hw_local_irq_enable(level);
+            _can_tx_submit_end(can);
 
             pmsg++;
             sent_size += sizeof(struct rt_can_msg);
@@ -369,6 +809,7 @@ static rt_ssize_t _can_nonblocking_tx(struct rt_can_device *can, const struct rt
             /* Buffer is full, cannot process this message or subsequent ones. */
             can->status.dropedsndpkg += (size - sent_size) / sizeof(struct rt_can_msg);
             rt_hw_local_irq_enable(level);
+            _can_tx_submit_end(can);
             break;
         }
     }
@@ -393,11 +834,13 @@ static rt_ssize_t _can_nonblocking_tx(struct rt_can_device *can, const struct rt
 static rt_err_t rt_can_open(struct rt_device *dev, rt_uint16_t oflag)
 {
     struct rt_can_device *can;
+    rt_bool_t first_open;
     char tmpname[16];
     RT_ASSERT(dev != RT_NULL);
     can = (struct rt_can_device *)dev;
 
     CAN_LOCK(can);
+    first_open = (dev->ref_count == 0);
 
     /* get open flags */
     dev->open_flag = oflag & 0xff;
@@ -485,11 +928,17 @@ static rt_err_t rt_can_open(struct rt_device *dev, rt_uint16_t oflag)
     }
 #endif
 
+    if (first_open)
+    {
 #ifdef RT_CAN_MALLOC_NB_TX_BUFFER
-    can->nb_tx_rb_pool = (rt_uint8_t *)rt_malloc(RT_CAN_NB_TX_FIFO_SIZE);
-    RT_ASSERT(can->nb_tx_rb_pool != RT_NULL);
+        can->nb_tx_rb_pool = (rt_uint8_t *)rt_malloc(RT_CAN_NB_TX_FIFO_SIZE);
+        RT_ASSERT(can->nb_tx_rb_pool != RT_NULL);
 #endif /* RT_CAN_MALLOC_NB_TX_BUFFER  */
-    rt_ringbuffer_init(&can->nb_tx_rb, can->nb_tx_rb_pool, RT_CAN_NB_TX_FIFO_SIZE);
+        rt_ringbuffer_init(&can->nb_tx_rb, can->nb_tx_rb_pool, RT_CAN_NB_TX_FIFO_SIZE);
+        rt_atomic_store(&can->tx_submit_refcnt, 0);
+        rt_atomic_store(&can->tx_active_refcnt, 0);
+        rt_atomic_store(&can->tx_state, RT_CAN_TX_STATE_ENABLED);
+    }
 
     if (!can->timerinitflag)
     {
@@ -506,6 +955,9 @@ static rt_err_t rt_can_open(struct rt_device *dev, rt_uint16_t oflag)
 static rt_err_t rt_can_close(struct rt_device *dev)
 {
     struct rt_can_device *can;
+    struct rt_can_abort_tx_config abort_cfg;
+    rt_bool_t controller_stopped = RT_FALSE;
+    rt_err_t result;
 
     RT_ASSERT(dev != RT_NULL);
     can = (struct rt_can_device *)dev;
@@ -519,13 +971,77 @@ static rt_err_t rt_can_close(struct rt_device *dev)
         return RT_EOK;
     }
 
-#ifdef RT_CAN_MALLOC_NB_TX_BUFFER
-    if (can->nb_tx_rb_pool)
+    /* Stop admitting new TX work before touching any TX runtime resource. */
+    rt_atomic_store(&can->tx_state, RT_CAN_TX_STATE_DISABLED);
+
+    /* Wait until every sender that already crossed the gate has left low-level submission. */
+    result = _can_wait_tx_submit_refcnt(can, RT_WAITING_FOREVER);
+    if (result != RT_EOK)
     {
-        rt_free(can->nb_tx_rb_pool);
-        can->nb_tx_rb_pool = RT_NULL;
+        CAN_UNLOCK(can);
+        return result;
     }
-#endif
+
+    if (can->ops->abort_tx != RT_NULL)
+    {
+        abort_cfg.mailbox_mask = RT_CAN_TX_MAILBOX_ALL;
+        abort_cfg.timeout = RT_CANSND_MSG_TIMEOUT;
+        result = can->ops->abort_tx(can, &abort_cfg);
+        if (result != RT_EOK)
+        {
+            /*
+             * If synchronous abort cannot establish hardware idle, stop the
+             * controller before retiring software ownership or freeing memory.
+             */
+            result = can->ops->control(can, RT_CAN_CMD_START, RT_FALSE);
+            if (result != RT_EOK)
+            {
+                CAN_UNLOCK(can);
+                return result;
+            }
+            controller_stopped = RT_TRUE;
+        }
+    }
+    else
+    {
+        /* Drivers without abort support must stop hardware before software retirement. */
+        result = can->ops->control(can, RT_CAN_CMD_START, RT_FALSE);
+        if (result != RT_EOK)
+        {
+            CAN_UNLOCK(can);
+            return result;
+        }
+        controller_stopped = RT_TRUE;
+    }
+
+    /* Hardware is idle/stopped, so blocking ownership can now be retired safely. */
+    _can_retire_blocking_tx(can);
+
+    /*
+     * Completion and semaphore wakeups above may still be unwinding public
+     * rt_device_write() calls. Keep all TX runtime resources alive until those
+     * writers have returned.
+     */
+    result = _can_wait_tx_active_refcnt(can, RT_WAITING_FOREVER);
+    if (result != RT_EOK)
+    {
+        CAN_UNLOCK(can);
+        return result;
+    }
+
+    /*
+     * Complete hardware shutdown before releasing software resources. If stop
+     * fails, keep the TX runtime intact so the device is not left half-closed.
+     */
+    if (!controller_stopped)
+    {
+        result = can->ops->control(can, RT_CAN_CMD_START, RT_FALSE);
+        if (result != RT_EOK)
+        {
+            CAN_UNLOCK(can);
+            return result;
+        }
+    }
 
     if (can->timerinitflag)
     {
@@ -564,12 +1080,11 @@ static rt_err_t rt_can_close(struct rt_device *dev)
     {
         struct rt_can_tx_fifo *tx_fifo;
 
-        /* clear can tx interrupt */
+        /* clear can tx interrupt before releasing TX runtime memory */
         can->ops->control(can, RT_DEVICE_CTRL_CLR_INT, (void *)RT_DEVICE_FLAG_INT_TX);
 
         tx_fifo = (struct rt_can_tx_fifo *)can->can_tx;
         RT_ASSERT(tx_fifo != RT_NULL);
-
         rt_sem_detach(&(tx_fifo->sem));
         rt_free(tx_fifo);
         dev->open_flag &= ~RT_DEVICE_FLAG_INT_TX;
@@ -577,7 +1092,15 @@ static rt_err_t rt_can_close(struct rt_device *dev)
     }
 
     can->ops->control(can, RT_DEVICE_CTRL_CLR_INT, (void *)RT_DEVICE_CAN_INT_ERR);
-    can->ops->control(can, RT_CAN_CMD_START, RT_FALSE);
+
+#ifdef RT_CAN_MALLOC_NB_TX_BUFFER
+    if (can->nb_tx_rb_pool)
+    {
+        rt_free(can->nb_tx_rb_pool);
+        can->nb_tx_rb_pool = RT_NULL;
+    }
+#endif
+
     CAN_UNLOCK(can);
 
     return RT_EOK;
@@ -627,6 +1150,7 @@ static rt_ssize_t rt_can_write(struct rt_device *dev,
 {
     struct rt_can_device *can;
     const struct rt_can_msg *pmsg;
+    rt_ssize_t result;
 
     RT_ASSERT(dev != RT_NULL);
     RT_ASSERT(buffer != RT_NULL);
@@ -648,27 +1172,47 @@ static rt_ssize_t rt_can_write(struct rt_device *dev,
     }
 
     /*
+     * Span the complete write lifetime so close/flush cannot release TX runtime
+     * resources while a blocking writer is waiting on a semaphore/completion.
+     */
+    rt_atomic_add(&can->tx_active_refcnt, 1);
+
+    if (rt_atomic_load(&can->tx_state) != RT_CAN_TX_STATE_ENABLED)
+    {
+        result = -RT_EBUSY;
+        goto write_done;
+    }
+
+    /*
      * Routing to the non-blocking send scenario:
      * 1. Called from within an interrupt context.
      * 2. Called from a thread, but the user explicitly set the nonblocking flag on the first message.
      */
     if (rt_interrupt_get_nest() > 0 || pmsg->nonblocking)
     {
-        return _can_nonblocking_tx(can, pmsg, size);
+        result = _can_nonblocking_tx(can, pmsg, size);
+        goto write_done;
     }
 
     if (dev->open_flag & RT_DEVICE_FLAG_INT_TX)
     {
         if (can->config.privmode)
         {
-            return _can_int_tx_priv(can, buffer, size);
+            result = _can_int_tx_priv(can, buffer, size);
         }
         else
         {
-            return _can_int_tx(can, buffer, size);
+            result = _can_int_tx(can, buffer, size);
         }
     }
-    return -RT_ENOSYS;
+    else
+    {
+        result = -RT_ENOSYS;
+    }
+
+write_done:
+    rt_atomic_sub(&can->tx_active_refcnt, 1);
+    return result;
 }
 
 static rt_err_t rt_can_control(struct rt_device *dev,
@@ -699,6 +1243,128 @@ static rt_err_t rt_can_control(struct rt_device *dev,
         res = can->ops->configure(can, (struct can_configure *)args);
         break;
 
+    case RT_CAN_CMD_SET_TX_ENABLE:
+        if (rt_interrupt_get_nest() > 0)
+        {
+            return -RT_EINVAL;
+        }
+
+        /* Serialize the public gate change with close and controller teardown. */
+        CAN_LOCK(can);
+        if (dev->ref_count == 0)
+        {
+            res = -RT_EBUSY;
+        }
+        else
+        {
+            res = _can_set_tx_enabled(can, (rt_bool_t)((rt_ubase_t)args != 0));
+        }
+        CAN_UNLOCK(can);
+        break;
+
+    case RT_CAN_CMD_ABORT_TX:
+    {
+        struct rt_can_abort_tx_config default_cfg;
+        struct rt_can_abort_tx_config abort_cfg;
+        const struct rt_can_abort_tx_config *requested_cfg;
+        rt_base_t expected;
+        rt_tick_t start_tick;
+        rt_tick_t elapsed;
+
+        /* The abort operation is synchronous and may block while waiting for hardware idle. */
+        if (rt_interrupt_get_nest() > 0)
+        {
+            return -RT_EINVAL;
+        }
+
+        if (can->ops->abort_tx == RT_NULL)
+        {
+            return -RT_ENOSYS;
+        }
+
+        if (args == RT_NULL)
+        {
+            default_cfg.mailbox_mask = RT_CAN_TX_MAILBOX_ALL;
+            default_cfg.timeout = RT_CANSND_MSG_TIMEOUT;
+            requested_cfg = &default_cfg;
+        }
+        else
+        {
+            requested_cfg = (const struct rt_can_abort_tx_config *)args;
+        }
+
+        if (requested_cfg->timeout < 0 && requested_cfg->timeout != RT_WAITING_FOREVER)
+        {
+            return -RT_EINVAL;
+        }
+        abort_cfg = *requested_cfg;
+
+        /*
+         * Direct hardware abort is intentionally not a full flush. Require the
+         * caller to close the TX admission gate first, then reserve FLUSHING so
+         * another thread cannot re-enable TX while submitters drain or hardware
+         * abort is in progress. Software queues are left untouched and are not
+         * restarted by this command; use a full flush when queued frames must not
+         * survive the quiesce operation.
+         */
+        CAN_LOCK(can);
+        if (dev->ref_count == 0)
+        {
+            CAN_UNLOCK(can);
+            return -RT_EBUSY;
+        }
+
+        expected = RT_CAN_TX_STATE_DISABLED;
+        if (!rt_atomic_compare_exchange_strong(&can->tx_state, &expected, RT_CAN_TX_STATE_FLUSHING))
+        {
+            CAN_UNLOCK(can);
+            return -RT_EBUSY;
+        }
+
+        start_tick = rt_tick_get();
+        res = _can_wait_tx_submit_refcnt(can, abort_cfg.timeout);
+        if (res == RT_EOK)
+        {
+            if (abort_cfg.timeout != RT_WAITING_FOREVER)
+            {
+                elapsed = (rt_tick_t)(rt_tick_get() - start_tick);
+                abort_cfg.timeout = elapsed >= (rt_tick_t)abort_cfg.timeout ?
+                                    0 : abort_cfg.timeout - (rt_int32_t)elapsed;
+            }
+            res = can->ops->abort_tx(can, &abort_cfg);
+        }
+
+        rt_atomic_store(&can->tx_state, RT_CAN_TX_STATE_DISABLED);
+        CAN_UNLOCK(can);
+        break;
+    }
+
+    case RT_CAN_CMD_FLUSH_TX:
+    {
+        rt_int32_t timeout = RT_CANSND_MSG_TIMEOUT;
+
+        if (rt_interrupt_get_nest() > 0)
+        {
+            return -RT_EINVAL;
+        }
+
+        if (args != RT_NULL)
+        {
+            timeout = *(const rt_int32_t *)args;
+        }
+
+        /* Serialize the full quiesce sequence with close and controller deinitialization. */
+        CAN_LOCK(can);
+        if (dev->ref_count == 0)
+        {
+            CAN_UNLOCK(can);
+            return -RT_EBUSY;
+        }
+        res = _can_flush_tx(can, timeout);
+        CAN_UNLOCK(can);
+        break;
+    }
+
     case RT_CAN_CMD_SET_PRIV:
         /* configure device */
         if ((rt_uint32_t)(rt_ubase_t)args != can->config.privmode)
@@ -706,6 +1372,21 @@ static rt_err_t rt_can_control(struct rt_device *dev,
             int i;
             rt_base_t level;
             struct rt_can_tx_fifo *tx_fifo;
+
+            /*
+             * Private-mode selection is a configuration-time operation. The
+             * caller must serialize this command with all CAN TX users and invoke
+             * it only when no TX path is active. sndchange is only a defensive
+             * check for outstanding blocking ownership; it does not make live
+             * mode conversion thread-safe.
+             */
+            level = rt_hw_local_irq_disable();
+            if (can->status.sndchange != 0)
+            {
+                rt_hw_local_irq_enable(level);
+                return -RT_EBUSY;
+            }
+            rt_hw_local_irq_enable(level);
 
             res = can->ops->control(can, cmd, args);
             if (res != RT_EOK) return res;
@@ -732,7 +1413,8 @@ static rt_err_t rt_can_control(struct rt_device *dev,
                 for (i = 0;  i < can->config.sndboxnumber; i++)
                 {
                     level = rt_hw_local_irq_disable();
-                    if (tx_fifo->buffer[i].result == RT_CAN_SND_RESULT_OK)
+                    tx_fifo->buffer[i].result = RT_CAN_SND_RESULT_OK;
+                    if (rt_list_isempty(&tx_fifo->buffer[i].list))
                     {
                         rt_list_insert_before(&tx_fifo->freelist, &tx_fifo->buffer[i].list);
                     }
@@ -940,6 +1622,9 @@ rt_err_t rt_hw_can_register(struct rt_can_device    *can,
     can->status_indicate.ind  = RT_NULL;
     can->status_indicate.args = RT_NULL;
     rt_memset(&can->status, 0, sizeof(can->status));
+    rt_atomic_store(&can->tx_state, RT_CAN_TX_STATE_DISABLED);
+    rt_atomic_store(&can->tx_submit_refcnt, 0);
+    rt_atomic_store(&can->tx_active_refcnt, 0);
 
     device->user_data   = data;
 
@@ -1104,21 +1789,55 @@ void rt_hw_can_isr(struct rt_can_device *can, int event)
     {
         struct rt_can_tx_fifo *tx_fifo;
         rt_uint32_t no;
+        rt_base_t level;
+        rt_bool_t complete_blocking = RT_FALSE;
+        rt_bool_t release_mailbox = RT_FALSE;
+
         no = event >> 8;
         tx_fifo = (struct rt_can_tx_fifo *) can->can_tx;
-        RT_ASSERT(tx_fifo != RT_NULL);
 
-        if (can->status.sndchange&(1<<no))
+        if (tx_fifo != RT_NULL && no < can->config.sndboxnumber)
         {
-            if ((event & 0xff) == RT_CAN_EVENT_TX_DONE)
+            level = rt_hw_local_irq_disable();
+            if (can->status.sndchange & (1UL << no))
             {
-                tx_fifo->buffer[no].result = RT_CAN_SND_RESULT_OK;
+                /*
+                 * ERR together with sndchange denotes a normal blocking sender
+                 * which timed out while hardware still owned this mailbox. That
+                 * sender is gone, so the ISR must reclaim the software slot.
+                 */
+                if (tx_fifo->buffer[no].result == RT_CAN_SND_RESULT_ERR &&
+                    rt_list_isempty(&tx_fifo->buffer[no].list))
+                {
+                    rt_list_insert_before(&tx_fifo->freelist, &tx_fifo->buffer[no].list);
+                    release_mailbox = RT_TRUE;
+                }
+                else
+                {
+                    complete_blocking = RT_TRUE;
+                }
+
+                /* Consume ownership before wake-up/release so a late TX/abort IRQ cannot complete it twice. */
+                can->status.sndchange &= ~(1UL << no);
+                if ((event & 0xff) == RT_CAN_EVENT_TX_DONE)
+                {
+                    tx_fifo->buffer[no].result = RT_CAN_SND_RESULT_OK;
+                }
+                else
+                {
+                    tx_fifo->buffer[no].result = RT_CAN_SND_RESULT_ERR;
+                }
             }
-            else
+            rt_hw_local_irq_enable(level);
+
+            if (release_mailbox)
             {
-                tx_fifo->buffer[no].result = RT_CAN_SND_RESULT_ERR;
+                rt_sem_release(&tx_fifo->sem);
             }
-            rt_completion_done(&(tx_fifo->buffer[no].completion));
+            else if (complete_blocking)
+            {
+                rt_completion_done(&(tx_fifo->buffer[no].completion));
+            }
         }
 
         if (can->ops->sendmsg_nonblocking != RT_NULL)
@@ -1126,8 +1845,12 @@ void rt_hw_can_isr(struct rt_can_device *can, int event)
             while (RT_TRUE)
             {
                 struct rt_can_msg msg_to_send;
-                rt_base_t level;
                 rt_bool_t msg_was_present = RT_FALSE;
+
+                if (!_can_tx_submit_begin(can))
+                {
+                    break;
+                }
 
                 level = rt_hw_local_irq_disable();
                 if (rt_ringbuffer_data_len(&can->nb_tx_rb) >= sizeof(struct rt_can_msg))
@@ -1139,6 +1862,7 @@ void rt_hw_can_isr(struct rt_can_device *can, int event)
 
                 if (!msg_was_present)
                 {
+                    _can_tx_submit_end(can);
                     break;
                 }
 
@@ -1147,8 +1871,11 @@ void rt_hw_can_isr(struct rt_can_device *can, int event)
                     level = rt_hw_local_irq_disable();
                     rt_ringbuffer_put_force(&can->nb_tx_rb, (rt_uint8_t *)&msg_to_send, sizeof(struct rt_can_msg));
                     rt_hw_local_irq_enable(level);
+                    _can_tx_submit_end(can);
                     break;
                 }
+
+                _can_tx_submit_end(can);
             }
         }
         break;

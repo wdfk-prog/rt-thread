@@ -9,6 +9,7 @@
  * 2015-07-06     Bernard           remove RT_CAN_USING_LED.
  * 2022-05-08     hpmicro           add CANFD support, fixed typos
  * 2025-09-20     wdfk_prog         Added non-blocking send mechanism APIs and data structures.
+ * 2026-08-26     wdfk_prog         Add TX gate, full flush and hardware abort APIs.
  */
 
 #ifndef __DEV_CAN_H_
@@ -429,7 +430,16 @@ struct rt_can_ops;
 #define RT_CAN_CMD_SET_FILTER       0x13
 #define RT_CAN_CMD_SET_BAUD         0x14
 #define RT_CAN_CMD_SET_MODE         0x15
+
+/**
+ * @brief Enable or disable private TX mailbox mode.
+ *
+ * Private-mode selection is a configuration-time operation. The caller must
+ * serialize this command with all CAN TX users and invoke it only when no TX
+ * path is active. Concurrent runtime mode switching with TX activity is unsupported.
+ */
 #define RT_CAN_CMD_SET_PRIV         0x16
+
 #define RT_CAN_CMD_GET_STATUS       0x17
 #define RT_CAN_CMD_SET_STATUS_IND   0x18
 #define RT_CAN_CMD_SET_BUS_HOOK     0x19
@@ -438,7 +448,68 @@ struct rt_can_ops;
 #define RT_CAN_CMD_SET_BITTIMING    0x1C
 #define RT_CAN_CMD_START            0x1D
 
+/**
+ * @brief Enable or disable new framework TX submissions.
+ *
+ * This command changes only TX admission; it does not wait for active submissions
+ * or abort pending hardware TX. Use `RT_CAN_CMD_FLUSH_TX` for TX quiescence.
+ *
+ * @note `args` is a pointer-sized boolean value: pass `(void *)RT_TRUE` to enable
+ *       or `(void *)RT_FALSE` to disable. Do not pass the address of an `rt_bool_t`.
+ * @note Call from thread context; public control is serialized with lifecycle operations.
+ */
+#define RT_CAN_CMD_SET_TX_ENABLE    0x1E
+
+/**
+ * @brief Abort selected hardware TX mailboxes synchronously.
+ *
+ * The framework TX admission gate must already be disabled with
+ * `RT_CAN_CMD_SET_TX_ENABLE` before this command is issued. The command then
+ * prevents the gate from being re-enabled, waits for in-progress submissions
+ * to leave the TX submission section, and aborts the selected hardware mailboxes.
+ * It intentionally leaves the non-blocking software queue untouched and does
+ * not restart or drain that queue when TX is later re-enabled. Use
+ * `RT_CAN_CMD_FLUSH_TX` when a complete software-and-hardware TX quiesce is
+ * required or when queued frames must not survive the quiesce operation.
+ *
+ * @note This command must be called from thread context.
+ * @note The command returns `-RT_EBUSY` if new TX submissions are still enabled.
+ * @note `args` may be `RT_NULL` for all mailboxes with the default timeout,
+ *       or point to a `struct rt_can_abort_tx_config`.
+ */
+#define RT_CAN_CMD_ABORT_TX         0x1F
+
+/**
+ * @brief Fully quiesce CAN TX and leave new TX submissions disabled.
+ *
+ * The command drains active submissions, clears software TX queues, aborts hardware
+ * TX, wakes blocking senders and waits for active write paths before returning.
+ *
+ * @note Once a flush attempt begins, TX remains disabled if hardware abort is
+ *       unsupported or a later flush stage fails.
+ * @note This command must be called from thread context.
+ * @note `args` may be `RT_NULL` for default timeout or point to an `rt_int32_t` timeout in OS ticks.
+ */
+#define RT_CAN_CMD_FLUSH_TX         0x20
+
+#define RT_CAN_TX_MAILBOX_0         (1UL << 0)
+#define RT_CAN_TX_MAILBOX_1         (1UL << 1)
+#define RT_CAN_TX_MAILBOX_2         (1UL << 2)
+#define RT_CAN_TX_MAILBOX_ALL       0xFFFFFFFFUL
+
 #define RT_DEVICE_CAN_INT_ERR       0x1000
+
+/**
+ * @brief Hardware TX abort configuration.
+ *
+ * This configuration is used by `RT_CAN_CMD_ABORT_TX` and low-level CAN drivers.
+ * Hardware abort does not clear framework software queues or complete blocking senders.
+ */
+struct rt_can_abort_tx_config
+{
+    rt_uint32_t mailbox_mask; /**< Generic mailbox bit mask. Use RT_CAN_TX_MAILBOX_ALL to abort every hardware TX mailbox. */
+    rt_int32_t timeout;       /**< Timeout in OS ticks. RT_WAITING_FOREVER waits without a deadline. */
+};
 
 enum RT_CAN_STATUS_MODE
 {
@@ -577,6 +648,10 @@ struct rt_can_device
     void *can_rx;                       /**< A pointer to the software receive FIFO structure (`rt_can_rx_fifo`). */
     void *can_tx;                       /**< A pointer to the software transmit FIFO structure (`rt_can_tx_fifo`). */
 
+    rt_atomic_t tx_state;               /**< Framework TX state: disabled, enabled, or flushing. */
+    rt_atomic_t tx_submit_refcnt;       /**< Number of send paths currently inside the TX submission section. */
+    rt_atomic_t tx_active_refcnt;       /**< Number of active write paths that may still reference TX runtime resources. */
+
     struct rt_ringbuffer nb_tx_rb;      /**< The ring buffer for non-blocking transmissions. */
 #ifdef RT_CAN_MALLOC_NB_TX_BUFFER
     rt_uint8_t *nb_tx_rb_pool;          /**< A pointer to the dynamically allocated pool for the non-blocking TX ring buffer. */
@@ -622,6 +697,7 @@ struct rt_can_rx_fifo
 #define RT_CAN_SND_RESULT_OK        0
 #define RT_CAN_SND_RESULT_ERR       1
 #define RT_CAN_SND_RESULT_WAIT      2
+#define RT_CAN_SND_RESULT_ABORT     3
 
 #define RT_CAN_EVENT_RX_IND         0x01    /* Rx indication */
 #define RT_CAN_EVENT_TX_DONE        0x02    /* Tx complete   */
@@ -637,7 +713,7 @@ struct rt_can_sndbxinx_list
 {
     struct rt_list_node list;       /**< List node to link into the free list. */
     struct rt_completion completion;/**< A completion object to block the sending thread. */
-    rt_uint32_t result;             /**< The result of the transmission (OK, ERR, WAIT). */
+    rt_uint32_t result;             /**< The result of the transmission (OK, ERR, WAIT, ABORT). */
 };
 
 /**
@@ -705,6 +781,23 @@ struct rt_can_ops
      * - Other negative error codes for different failures.
      */
     rt_ssize_t (*sendmsg_nonblocking)(struct rt_can_device *can, const void *buf);
+    /**
+     * @brief Synchronously abort hardware TX requests already submitted to the CAN controller.
+     *
+     * This operation only handles hardware pending TX. Software queues and
+     * blocking sender ownership are managed by the CAN framework. A successful
+     * return guarantees that the selected hardware TX mailboxes are idle only
+     * while the caller prevents concurrent TX submissions. `RT_CAN_CMD_ABORT_TX`
+     * establishes this condition before invoking the low-level operation; direct
+     * driver callers must provide equivalent exclusion.
+     *
+     * @note This operation is called from thread context only.
+     *
+     * @param[in] can A pointer to the CAN device structure.
+     * @param[in] cfg A pointer to the hardware TX abort configuration.
+     * @return `RT_EOK` on success, `-RT_ENOSYS` when unsupported, or another negative error code.
+     */
+    rt_err_t (*abort_tx)(struct rt_can_device *can, const struct rt_can_abort_tx_config *cfg);
 };
 
 /**

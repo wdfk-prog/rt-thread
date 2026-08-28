@@ -16,6 +16,7 @@
                                f4-series only.
  * 2025-09-20     wdfk_prog    Implemented sendmsg_nonblocking op to support framework's async TX.
  * 2026-02-02     wdfk_prog    Drain multiple RX frames per ISR with a bounded limit.
+ * 2026-08-26     wdfk_prog    Support aborting pending hardware TX mailboxes.
  */
 
 #include "drv_can.h"
@@ -186,6 +187,135 @@ static rt_err_t _can_config(struct rt_can_device *can, struct can_configure *cfg
     HAL_CAN_ConfigFilter(&drv_can->CanHandle, &drv_can->FilterConfig);
 
     return RT_EOK;
+}
+
+/**
+ * @brief Synchronously abort selected STM32 bxCAN TX mailboxes.
+ *
+ * The generic mailbox mask is translated to the corresponding HAL mailbox
+ * mask. Only non-empty selected mailboxes are aborted. After issuing the HAL
+ * abort request, this function waits until every targeted mailbox reports its
+ * TME bit set so callers can rely on hardware TX being quiescent on success.
+ *
+ * @note This function must be called from thread context because it may sleep
+ *       while waiting for the hardware abort to complete.
+ * @note The caller must prevent concurrent TX submissions while this function
+ *       runs. `RT_CAN_CMD_ABORT_TX` establishes this exclusion before invoking
+ *       the driver operation; direct callers must provide equivalent exclusion.
+ *
+ * @param[in] can A pointer to the CAN device.
+ * @param[in] cfg A pointer to the mailbox mask and timeout configuration.
+ * @return RT_EOK on success, -RT_ETIMEOUT on timeout, or another negative error code.
+ */
+static rt_err_t _can_abort_tx(struct rt_can_device *can, const struct rt_can_abort_tx_config *cfg)
+{
+    struct stm32_can *drv_can;
+    CAN_HandleTypeDef *hcan;
+    rt_uint32_t requested_mask;
+    rt_uint32_t pending_mask = 0;
+    rt_uint32_t hal_mask = 0;
+    rt_uint32_t tsr;
+    rt_tick_t start_tick;
+
+    RT_ASSERT(can != RT_NULL);
+    if (cfg == RT_NULL)
+    {
+        return -RT_EINVAL;
+    }
+
+    if (cfg->timeout < 0 && cfg->timeout != RT_WAITING_FOREVER)
+    {
+        return -RT_EINVAL;
+    }
+
+    if (rt_interrupt_get_nest() > 0)
+    {
+        return -RT_EINVAL;
+    }
+
+    drv_can = (struct stm32_can *)can->parent.user_data;
+    RT_ASSERT(drv_can != RT_NULL);
+    hcan = &drv_can->CanHandle;
+
+    if (hcan->State == HAL_CAN_STATE_RESET)
+    {
+        return RT_EOK;
+    }
+
+    if (hcan->State != HAL_CAN_STATE_READY &&
+        hcan->State != HAL_CAN_STATE_LISTENING)
+    {
+        return -RT_EBUSY;
+    }
+
+    requested_mask = cfg->mailbox_mask;
+    tsr = READ_REG(hcan->Instance->TSR);
+
+    if ((requested_mask & RT_CAN_TX_MAILBOX_0) != 0 && (tsr & CAN_TSR_TME0) == 0)
+    {
+        pending_mask |= RT_CAN_TX_MAILBOX_0;
+        hal_mask |= CAN_TX_MAILBOX0;
+    }
+    if ((requested_mask & RT_CAN_TX_MAILBOX_1) != 0 && (tsr & CAN_TSR_TME1) == 0)
+    {
+        pending_mask |= RT_CAN_TX_MAILBOX_1;
+        hal_mask |= CAN_TX_MAILBOX1;
+    }
+    if ((requested_mask & RT_CAN_TX_MAILBOX_2) != 0 && (tsr & CAN_TSR_TME2) == 0)
+    {
+        pending_mask |= RT_CAN_TX_MAILBOX_2;
+        hal_mask |= CAN_TX_MAILBOX2;
+    }
+
+    if (hal_mask == 0)
+    {
+        return RT_EOK;
+    }
+
+    if (HAL_CAN_AbortTxRequest(hcan, hal_mask) != HAL_OK)
+    {
+        LOG_E("can%s abort tx request failed", drv_can->name);
+        return -RT_ERROR;
+    }
+
+    start_tick = rt_tick_get();
+    while (RT_TRUE)
+    {
+        rt_bool_t done = RT_TRUE;
+        tsr = READ_REG(hcan->Instance->TSR);
+
+        if ((pending_mask & RT_CAN_TX_MAILBOX_0) != 0 && (tsr & CAN_TSR_TME0) == 0)
+        {
+            done = RT_FALSE;
+        }
+        if ((pending_mask & RT_CAN_TX_MAILBOX_1) != 0 && (tsr & CAN_TSR_TME1) == 0)
+        {
+            done = RT_FALSE;
+        }
+        if ((pending_mask & RT_CAN_TX_MAILBOX_2) != 0 && (tsr & CAN_TSR_TME2) == 0)
+        {
+            done = RT_FALSE;
+        }
+
+        if (done)
+        {
+            return RT_EOK;
+        }
+
+        if (cfg->timeout == 0)
+        {
+            return -RT_ETIMEOUT;
+        }
+
+        if (cfg->timeout != RT_WAITING_FOREVER &&
+            (rt_tick_t)(rt_tick_get() - start_tick) >= (rt_tick_t)cfg->timeout)
+        {
+            LOG_E("can%s abort tx timeout", drv_can->name);
+            return -RT_ETIMEOUT;
+        }
+
+        rt_thread_mdelay(1);
+    }
 }
 
 static rt_err_t _can_control(struct rt_can_device *can, int cmd, void *arg)
@@ -743,6 +873,7 @@ static const struct rt_can_ops _can_ops =
     .sendmsg    = _can_sendmsg,
     .recvmsg    = _can_recvmsg,
     .sendmsg_nonblocking = _can_sendmsg_nonblocking,
+    .abort_tx   = _can_abort_tx,
 };
 
 static void _can_rx_isr(struct rt_can_device *can, rt_uint32_t fifo)
