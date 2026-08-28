@@ -55,6 +55,20 @@ static rt_int16_t _tx_find_mailbox_locked(struct rt_can_device *can,
 {
     rt_uint16_t i;
 
+    /*
+     * Strict wire order is the generic fallback. Unless the driver explicitly
+     * reports ordered multi-mailbox transmission, keep at most one request in
+     * hardware so a later CAN ID cannot overtake an earlier request locally.
+     */
+    if (!(rt_can_runtime_get(can)->capabilities & RT_CAN_CAP_TX_ORDERED_MAILBOX))
+    {
+        for (i = 0; i < tx->mailbox_count; i++)
+        {
+            if (tx->mailbox_owner[i] != RT_NULL)
+                return -1;
+        }
+    }
+
     if (can->config.privmode)
     {
         if (req->msg.priv >= tx->mailbox_count)
@@ -351,6 +365,10 @@ rt_err_t rt_can_tx_runtime_init(struct rt_can_device *can, struct rt_can_runtime
         rt_completion_init(&tx->requests[i].completion);
         rt_list_insert_before(&tx->free_list, &tx->requests[i].node);
     }
+    runtime->capabilities = 0;
+    if (can->ops->control != RT_NULL)
+        can->ops->control(can, RT_CAN_CMD_GET_CAPABILITIES, &runtime->capabilities);
+
     runtime->core.lifecycle_state = RT_CAN_LC_RUNNING;
     return RT_EOK;
 

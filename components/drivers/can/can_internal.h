@@ -38,6 +38,7 @@ struct rt_can_tx_request
 struct rt_can_runtime
 {
     struct rt_can_core core;
+    rt_uint32_t capabilities;
 };
 
 static rt_inline struct rt_can_runtime *rt_can_runtime_get(struct rt_can_device *can)

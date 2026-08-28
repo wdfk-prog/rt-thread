@@ -15,6 +15,7 @@ static rt_uint32_t _last_id;
 static rt_uint32_t _callback_count;
 static rt_err_t _callback_result;
 static volatile rt_bool_t _blocking_done;
+static rt_uint32_t _fake_caps;
 
 static rt_err_t _fake_configure(struct rt_can_device *can, struct can_configure *cfg)
 {
@@ -26,8 +27,11 @@ static rt_err_t _fake_configure(struct rt_can_device *can, struct can_configure 
 static rt_err_t _fake_control(struct rt_can_device *can, int cmd, void *arg)
 {
     RT_UNUSED(can);
-    RT_UNUSED(cmd);
-    RT_UNUSED(arg);
+    if (cmd == RT_CAN_CMD_GET_CAPABILITIES && arg != RT_NULL)
+    {
+        *(rt_uint32_t *)arg = _fake_caps;
+        return RT_EOK;
+    }
     return RT_EOK;
 }
 
@@ -162,18 +166,50 @@ static void can_tx_timeout_keeps_owner_tc(void)
     rt_thread_delete(tid);
 }
 
+static void can_tx_strict_order_tc(void)
+{
+    struct rt_can_msg msgs[3] = {0};
+    rt_uint32_t mailbox;
+
+    _submit_count = 0;
+    msgs[0].id = 0x700;
+    msgs[0].ide = RT_CAN_STDID;
+    msgs[0].rtr = RT_CAN_DTR;
+    msgs[0].len = 1;
+    msgs[0].nonblocking = 1;
+    msgs[1] = msgs[0];
+    msgs[1].id = 0x100;
+    msgs[2] = msgs[0];
+    msgs[2].id = 0x300;
+
+    uassert_int_equal(rt_device_write((rt_device_t)&_fake_can, 0, msgs, sizeof(msgs)), sizeof(msgs));
+    uassert_int_equal(_submit_count, 1);
+    uassert_int_equal(_last_id, 0x700);
+    mailbox = _last_mailbox;
+
+    rt_hw_can_isr(&_fake_can, RT_CAN_EVENT_TX_DONE | (mailbox << 8));
+    uassert_int_equal(_submit_count, 2);
+    uassert_int_equal(_last_id, 0x100);
+    mailbox = _last_mailbox;
+    rt_hw_can_isr(&_fake_can, RT_CAN_EVENT_TX_DONE | (mailbox << 8));
+    uassert_int_equal(_submit_count, 3);
+    uassert_int_equal(_last_id, 0x300);
+    rt_hw_can_isr(&_fake_can, RT_CAN_EVENT_TX_DONE | (_last_mailbox << 8));
+}
+
 static rt_err_t utest_tc_init(void)
 {
     rt_err_t ret;
 
     rt_memset(&_fake_can, 0, sizeof(_fake_can));
     _fake_can.config = (struct can_configure)CANDEFAULTCONFIG;
-    _fake_can.config.sndboxnumber = 1;
+    _fake_can.config.sndboxnumber = 3;
     _fake_can.config.msgboxsz = 4;
     _fake_can.config.ticks = 100;
     _submit_count = 0;
     _last_mailbox = 0;
     _last_id = 0;
+    _fake_caps = 0;
 
     ret = rt_hw_can_register(&_fake_can, "cantx0", &_fake_ops, RT_NULL);
     if (ret != RT_EOK)
@@ -194,6 +230,7 @@ static void testcase(void)
     UTEST_UNIT_RUN(can_tx_fifo_schedule_tc);
     UTEST_UNIT_RUN(can_tx_callback_once_tc);
     UTEST_UNIT_RUN(can_tx_timeout_keeps_owner_tc);
+    UTEST_UNIT_RUN(can_tx_strict_order_tc);
 }
 
 UTEST_TC_EXPORT(testcase, "components.drivers.can.tx_engine",

@@ -7,6 +7,10 @@
 extern "C" {
 #endif
 
+#define RT_CAN_CMD_GET_CAPABILITIES      0x1e
+
+#define RT_CAN_CAP_TX_ORDERED_MAILBOX    (1UL << 0)
+
 /**
  * @brief Asynchronous CAN TX terminal callback.
  *
