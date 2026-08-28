@@ -56,11 +56,6 @@ static rt_int16_t _tx_find_mailbox_locked(struct rt_can_device *can,
 {
     rt_uint16_t i;
 
-    /*
-     * Strict wire order is the generic fallback. Unless the driver explicitly
-     * reports ordered multi-mailbox transmission, keep at most one request in
-     * hardware so a later CAN ID cannot overtake an earlier request locally.
-     */
     if (!(rt_can_runtime_get(can)->capabilities & RT_CAN_CAP_TX_ORDERED_MAILBOX))
     {
         for (i = 0; i < tx->mailbox_count; i++)
@@ -165,7 +160,8 @@ static void _tx_schedule(struct rt_can_device *can)
         rt_ssize_t ret;
 
         level = rt_spin_lock_irqsave(&tx->lock);
-        if ((runtime->core.lifecycle_state != RT_CAN_LC_RUNNING &&
+        if (runtime->core.bus_state == RT_CAN_BUS_OFF ||
+            (runtime->core.lifecycle_state != RT_CAN_LC_RUNNING &&
              !(runtime->core.lifecycle_state == RT_CAN_LC_QUIESCING &&
                runtime->quiesce_policy == RT_CAN_QUIESCE_DRAIN)) ||
             rt_list_isempty(&tx->pending_list))
@@ -223,7 +219,8 @@ static struct rt_can_tx_request *_tx_enqueue(struct rt_can_device *can,
     struct rt_can_tx_request *req;
     rt_base_t level;
 
-    if (runtime == RT_NULL || runtime->core.lifecycle_state != RT_CAN_LC_RUNNING)
+    if (runtime == RT_NULL || runtime->core.lifecycle_state != RT_CAN_LC_RUNNING ||
+        runtime->core.bus_state == RT_CAN_BUS_OFF)
         return RT_NULL;
     tx = &runtime->core.tx;
 
@@ -269,7 +266,6 @@ static rt_ssize_t _tx_submit_one(struct rt_can_device *can,
     wait_ret = rt_completion_wait(&req->completion, RT_CANSND_MSG_TIMEOUT);
     if (wait_ret != RT_EOK)
     {
-        /* A caller timeout only detaches the waiter; hardware ownership stays. */
         level = rt_spin_lock_irqsave(&tx->lock);
         if (!_tx_terminal(req->state))
         {
@@ -398,11 +394,6 @@ static void _tx_abort_owned(struct rt_can_device *can)
 
         if (req != RT_NULL)
         {
-            /*
-             * A successful abort request is not itself terminal. The driver
-             * must later report TX_DONE/TX_FAIL for this mailbox; ABORTING is
-             * retired exactly once by the common terminal path.
-             */
             if (can->ops->control(can, RT_CAN_CMD_ABORT_TX,
                                   (void *)(rt_ubase_t)i) != RT_EOK)
             {
@@ -508,6 +499,73 @@ void rt_can_tx_schedule_core(struct rt_can_device *can)
     _tx_schedule(can);
 }
 
+void rt_can_tx_bus_state_core(struct rt_can_device *can, enum rt_can_bus_state state)
+{
+    struct rt_can_runtime *runtime = rt_can_runtime_get(can);
+    struct rt_can_tx_core *tx;
+    rt_base_t level;
+
+    if (runtime == RT_NULL)
+        return;
+    tx = &runtime->core.tx;
+    level = rt_spin_lock_irqsave(&tx->lock);
+    runtime->core.bus_state = state;
+    rt_spin_unlock_irqrestore(&tx->lock, level);
+
+    if (state == RT_CAN_BUS_OFF)
+        _tx_cancel_queued(can);
+    else if (state == RT_CAN_BUS_ERROR_ACTIVE)
+        _tx_schedule(can);
+}
+
+void rt_hw_can_bus_state(struct rt_can_device *can, enum rt_can_bus_state state)
+{
+    if (can != RT_NULL)
+        rt_can_tx_bus_state_core(can, state);
+}
+
+rt_err_t rt_can_recover(struct rt_can_device *can)
+{
+    struct rt_can_runtime *runtime;
+    struct rt_can_tx_core *tx;
+    rt_base_t level;
+    rt_err_t ret;
+
+    if (can == RT_NULL || rt_interrupt_get_nest() > 0)
+        return -RT_EINVAL;
+    runtime = rt_can_runtime_get(can);
+    if (runtime == RT_NULL)
+        return -RT_EINVAL;
+    if (!(runtime->capabilities & RT_CAN_CAP_MANUAL_RECOVERY) || can->ops->control == RT_NULL)
+        return -RT_ENOSYS;
+
+    rt_mutex_take(&runtime->core.lifecycle_lock, RT_WAITING_FOREVER);
+    tx = &runtime->core.tx;
+    level = rt_spin_lock_irqsave(&tx->lock);
+    if (runtime->core.bus_state != RT_CAN_BUS_OFF ||
+        runtime->core.lifecycle_state != RT_CAN_LC_RUNNING)
+    {
+        rt_spin_unlock_irqrestore(&tx->lock, level);
+        rt_mutex_release(&runtime->core.lifecycle_lock);
+        return -RT_EBUSY;
+    }
+    runtime->core.lifecycle_state = RT_CAN_LC_RECOVERING;
+    rt_spin_unlock_irqrestore(&tx->lock, level);
+
+    ret = can->ops->control(can, RT_CAN_CMD_RECOVER, RT_NULL);
+
+    level = rt_spin_lock_irqsave(&tx->lock);
+    if (ret == RT_EOK)
+        runtime->core.bus_state = RT_CAN_BUS_ERROR_ACTIVE;
+    runtime->core.lifecycle_state = RT_CAN_LC_RUNNING;
+    rt_spin_unlock_irqrestore(&tx->lock, level);
+    rt_mutex_release(&runtime->core.lifecycle_lock);
+
+    if (ret == RT_EOK)
+        _tx_schedule(can);
+    return ret;
+}
+
 rt_err_t rt_can_tx_runtime_init(struct rt_can_device *can, struct rt_can_runtime *runtime)
 {
     struct rt_can_tx_core *tx = &runtime->core.tx;
@@ -547,6 +605,7 @@ rt_err_t rt_can_tx_runtime_init(struct rt_can_device *can, struct rt_can_runtime
     if (can->ops->control != RT_NULL)
         can->ops->control(can, RT_CAN_CMD_GET_CAPABILITIES, &runtime->capabilities);
 
+    runtime->core.bus_state = RT_CAN_BUS_ERROR_ACTIVE;
     runtime->core.lifecycle_state = RT_CAN_LC_RUNNING;
     return RT_EOK;
 
@@ -585,7 +644,6 @@ void rt_can_tx_isr_core(struct rt_can_device *can, int event)
     req = tx->mailbox_owner[mailbox];
     if (req == RT_NULL)
     {
-        /* Stale or duplicate completion: it cannot affect a new request. */
         rt_spin_unlock_irqrestore(&tx->lock, level);
         return;
     }

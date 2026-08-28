@@ -6,6 +6,7 @@
 #include <rtthread.h>
 #include <rtdevice.h>
 #include <drivers/can_tx.h>
+#include <drivers/can_state.h>
 #include <utest.h>
 
 static struct rt_can_device _fake_can;
@@ -17,6 +18,7 @@ static rt_err_t _callback_result;
 static volatile rt_bool_t _blocking_done;
 static rt_uint32_t _fake_caps;
 static rt_uint32_t _abort_count;
+static rt_uint32_t _recover_count;
 
 static rt_err_t _fake_configure(struct rt_can_device *can, struct can_configure *cfg)
 {
@@ -37,6 +39,11 @@ static rt_err_t _fake_control(struct rt_can_device *can, int cmd, void *arg)
         rt_uint32_t mailbox = (rt_uint32_t)(rt_ubase_t)arg;
         _abort_count++;
         rt_hw_can_isr(can, RT_CAN_EVENT_TX_FAIL | (mailbox << 8));
+        return RT_EOK;
+    }
+    if (cmd == RT_CAN_CMD_RECOVER)
+    {
+        _recover_count++;
         return RT_EOK;
     }
     return RT_EOK;
@@ -97,7 +104,6 @@ static void can_tx_fifo_schedule_tc(void)
     uassert_int_equal(rt_device_write(dev, 0, msgs, sizeof(msgs)), sizeof(msgs));
     uassert_int_equal(_submit_count, 1);
     uassert_int_equal(_last_id, 0x101);
-
     rt_hw_can_isr(&_fake_can, RT_CAN_EVENT_TX_DONE | (_last_mailbox << 8));
     uassert_int_equal(_submit_count, 2);
     uassert_int_equal(_last_id, 0x102);
@@ -113,7 +119,6 @@ static void can_tx_callback_once_tc(void)
     msg.ide = RT_CAN_STDID;
     msg.rtr = RT_CAN_DTR;
     msg.len = 1;
-
     _callback_count = 0;
     uassert_int_equal(rt_can_send_async(&_fake_can, &msg, _done_cb, RT_NULL), RT_EOK);
     mailbox = _last_mailbox;
@@ -126,13 +131,11 @@ static void can_tx_callback_once_tc(void)
 static void _blocking_writer(void *parameter)
 {
     struct rt_can_msg msg = {0};
-
     RT_UNUSED(parameter);
     msg.id = 0x301;
     msg.ide = RT_CAN_STDID;
     msg.rtr = RT_CAN_DTR;
     msg.len = 1;
-    msg.nonblocking = 0;
     rt_device_write((rt_device_t)&_fake_can, 0, &msg, sizeof(msg));
     _blocking_done = RT_TRUE;
 }
@@ -150,7 +153,6 @@ static void can_tx_timeout_keeps_owner_tc(void)
                            UTEST_THR_STACK_SIZE, 20, 10);
     uassert_not_null(tid);
     rt_thread_startup(tid);
-
     while (_submit_count == 0)
         rt_thread_mdelay(1);
     first_mailbox = _last_mailbox;
@@ -165,7 +167,6 @@ static void can_tx_timeout_keeps_owner_tc(void)
     next.nonblocking = 1;
     uassert_int_equal(rt_device_write((rt_device_t)&_fake_can, 0, &next, sizeof(next)), sizeof(next));
     uassert_int_equal(_submit_count, submit_before);
-
     rt_hw_can_isr(&_fake_can, RT_CAN_EVENT_TX_DONE | (first_mailbox << 8));
     uassert_int_equal(_submit_count, submit_before + 1);
     uassert_int_equal(_last_id, 0x302);
@@ -193,7 +194,6 @@ static void can_tx_strict_order_tc(void)
     uassert_int_equal(_submit_count, 1);
     uassert_int_equal(_last_id, 0x700);
     mailbox = _last_mailbox;
-
     rt_hw_can_isr(&_fake_can, RT_CAN_EVENT_TX_DONE | (mailbox << 8));
     uassert_int_equal(_submit_count, 2);
     uassert_int_equal(_last_id, 0x100);
@@ -218,7 +218,6 @@ static void can_tx_quiesce_abort_tc(void)
     msgs[0].nonblocking = 1;
     msgs[1] = msgs[0];
     msgs[1].id = 0x402;
-
     uassert_int_equal(rt_device_write((rt_device_t)&_fake_can, 0, msgs, sizeof(msgs)), sizeof(msgs));
     before = _submit_count;
     uassert_int_equal(rt_can_quiesce(&_fake_can, RT_CAN_QUIESCE_ABORT_ALL, 20), RT_EOK);
@@ -236,6 +235,29 @@ static void can_tx_quiesce_abort_tc(void)
     rt_hw_can_isr(&_fake_can, RT_CAN_EVENT_TX_DONE | (_last_mailbox << 8));
 }
 
+static void can_bus_off_recovery_tc(void)
+{
+    struct rt_can_msg msg = {0};
+    rt_uint32_t before;
+
+    msg.id = 0x501;
+    msg.ide = RT_CAN_STDID;
+    msg.rtr = RT_CAN_DTR;
+    msg.len = 1;
+    msg.nonblocking = 1;
+    before = _submit_count;
+    _recover_count = 0;
+
+    rt_hw_can_bus_state(&_fake_can, RT_CAN_BUS_OFF);
+    uassert_int_equal(rt_device_write((rt_device_t)&_fake_can, 0, &msg, sizeof(msg)), 0);
+    uassert_int_equal(_submit_count, before);
+    uassert_int_equal(rt_can_recover(&_fake_can), RT_EOK);
+    uassert_int_equal(_recover_count, 1);
+    uassert_int_equal(rt_device_write((rt_device_t)&_fake_can, 0, &msg, sizeof(msg)), sizeof(msg));
+    uassert_int_equal(_submit_count, before + 1);
+    rt_hw_can_isr(&_fake_can, RT_CAN_EVENT_TX_DONE | (_last_mailbox << 8));
+}
+
 static rt_err_t utest_tc_init(void)
 {
     rt_err_t ret;
@@ -248,9 +270,9 @@ static rt_err_t utest_tc_init(void)
     _submit_count = 0;
     _last_mailbox = 0;
     _last_id = 0;
-    _fake_caps = RT_CAN_CAP_TX_ABORT;
+    _fake_caps = RT_CAN_CAP_TX_ABORT | RT_CAN_CAP_MANUAL_RECOVERY;
     _abort_count = 0;
-
+    _recover_count = 0;
     ret = rt_hw_can_register(&_fake_can, "cantx0", &_fake_ops, RT_NULL);
     if (ret != RT_EOK)
         return ret;
@@ -272,6 +294,7 @@ static void testcase(void)
     UTEST_UNIT_RUN(can_tx_timeout_keeps_owner_tc);
     UTEST_UNIT_RUN(can_tx_strict_order_tc);
     UTEST_UNIT_RUN(can_tx_quiesce_abort_tc);
+    UTEST_UNIT_RUN(can_bus_off_recovery_tc);
 }
 
 UTEST_TC_EXPORT(testcase, "components.drivers.can.tx_engine",

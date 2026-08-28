@@ -6,6 +6,7 @@
 #include <rtdevice.h>
 #include "can_core.h"
 #include <drivers/can_tx.h>
+#include <drivers/can_state.h>
 
 #ifndef RT_CAN_TX_REQUEST_COUNT
 #define RT_CAN_TX_REQUEST_COUNT RT_CANMSG_BOX_SZ
@@ -56,6 +57,7 @@ rt_ssize_t rt_can_tx_write_core(struct rt_can_device *can, const struct rt_can_m
                                 rt_size_t size, rt_bool_t blocking);
 void rt_can_tx_isr_core(struct rt_can_device *can, int event);
 void rt_can_tx_schedule_core(struct rt_can_device *can);
+void rt_can_tx_bus_state_core(struct rt_can_device *can, enum rt_can_bus_state state);
 rt_err_t rt_can_tx_submit_async_core(struct rt_can_device *can, const struct rt_can_msg *msg,
                                      rt_can_tx_done_cb callback, void *arg);
 

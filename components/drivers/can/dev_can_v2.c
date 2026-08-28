@@ -131,6 +131,22 @@ static rt_err_t rt_can_close(struct rt_device *dev)
         return RT_EOK;
     }
 
+    if (can->can_tx != RT_NULL)
+    {
+        rt_err_t qret = rt_can_quiesce(can, RT_CAN_QUIESCE_ABORT_ALL, RT_CANSND_MSG_TIMEOUT);
+        struct rt_can_runtime *active_runtime = rt_can_runtime_get(can);
+        rt_base_t level;
+
+        if (qret != RT_EOK)
+        {
+            CAN_UNLOCK(can);
+            return qret;
+        }
+        level = rt_spin_lock_irqsave(&active_runtime->core.tx.lock);
+        active_runtime->core.lifecycle_state = RT_CAN_LC_CLOSING;
+        rt_spin_unlock_irqrestore(&active_runtime->core.tx.lock, level);
+    }
+
     if (can->timerinitflag)
     {
         can->timerinitflag = 0;
@@ -200,6 +216,38 @@ static rt_ssize_t rt_can_write(struct rt_device *dev, rt_off_t pos,
     return rt_can_tx_write_core(can, msg, size, blocking);
 }
 
+static rt_err_t _can_reconfigure(struct rt_can_device *can, int cmd, void *args,
+                                  enum rt_can_quiesce_policy policy,
+                                  rt_bool_t use_configure)
+{
+    struct rt_can_runtime *runtime = rt_can_runtime_get(can);
+    struct rt_can_tx_core *tx;
+    rt_base_t level;
+    rt_err_t ret;
+
+    ret = rt_can_quiesce(can, policy, RT_CANSND_MSG_TIMEOUT);
+    if (ret != RT_EOK)
+        return ret;
+
+    tx = &runtime->core.tx;
+    level = rt_spin_lock_irqsave(&tx->lock);
+    runtime->core.lifecycle_state = RT_CAN_LC_RECONFIGURING;
+    rt_spin_unlock_irqrestore(&tx->lock, level);
+
+    if (use_configure)
+        ret = can->ops->configure ? can->ops->configure(can, (struct can_configure *)args) : -RT_ENOSYS;
+    else
+        ret = can->ops->control ? can->ops->control(can, cmd, args) : -RT_ENOSYS;
+
+    level = rt_spin_lock_irqsave(&tx->lock);
+    runtime->core.lifecycle_state = RT_CAN_LC_QUIESCED;
+    rt_spin_unlock_irqrestore(&tx->lock, level);
+
+    if (ret == RT_EOK)
+        return rt_can_tx_resume(can);
+    return ret;
+}
+
 static rt_err_t rt_can_control(struct rt_device *dev, int cmd, void *args)
 {
     struct rt_can_device *can = (struct rt_can_device *)dev;
@@ -215,7 +263,7 @@ static rt_err_t rt_can_control(struct rt_device *dev, int cmd, void *args)
         dev->flag &= ~RT_DEVICE_FLAG_SUSPENDED;
         break;
     case RT_DEVICE_CTRL_CONFIG:
-        ret = can->ops->configure(can, (struct can_configure *)args);
+        ret = _can_reconfigure(can, cmd, args, RT_CAN_QUIESCE_DRAIN, RT_TRUE);
         break;
     case RT_CAN_CMD_SET_PRIV:
         if (can->ops->control == RT_NULL)
@@ -235,13 +283,13 @@ static rt_err_t rt_can_control(struct rt_device *dev, int cmd, void *args)
         ret = rt_can_tx_resume(can);
         break;
     case RT_CAN_CMD_SET_BAUD:
-        ret = rt_can_quiesce(can, RT_CAN_QUIESCE_ABORT_ALL, RT_CANSND_MSG_TIMEOUT);
-        if (ret == RT_EOK)
-        {
-            ret = can->ops->control ? can->ops->control(can, cmd, args) : -RT_ENOSYS;
-            if (ret == RT_EOK)
-                ret = rt_can_tx_resume(can);
-        }
+        ret = _can_reconfigure(can, cmd, args, RT_CAN_QUIESCE_ABORT_ALL, RT_FALSE);
+        break;
+    case RT_CAN_CMD_SET_MODE:
+        ret = _can_reconfigure(can, cmd, args, RT_CAN_QUIESCE_DRAIN, RT_FALSE);
+        break;
+    case RT_CAN_CMD_RECOVER:
+        ret = rt_can_recover(can);
         break;
 #ifdef RT_CAN_USING_HDR
     case RT_CAN_CMD_SET_FILTER:
