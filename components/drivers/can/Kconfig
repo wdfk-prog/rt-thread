@@ -25,53 +25,42 @@ if RT_USING_CAN
         default 16
         help
             This sets the capacity of the software buffer (FIFO) for incoming
-            CAN messages. It defines how many messages can be buffered by the
-            driver before the application must read them.
+            CAN messages.
 
     config RT_CANSND_BOX_NUM
-        int "Number of mailboxes for blocking send"
+        int "Number of CAN TX mailboxes"
         default 1
         help
-            This sets the number of concurrent blocking send operations that
-            can be in flight. It is typically matched to the number of
-            hardware transmission mailboxes on the CAN controller.
+            Number of framework-visible hardware TX mailboxes. The unified TX
+            scheduler owns these mailboxes for both blocking and non-blocking TX.
 
     config RT_CANSND_MSG_TIMEOUT
         int "Timeout for blocking send (in OS ticks)"
         default 100
         help
-            This sets the default time a thread will wait for a hardware
-            mailbox to become available when sending in blocking mode.
+            This sets the default time a blocking caller waits for TX completion.
+
+    config RT_CAN_TX_REQUEST_COUNT
+        int "Unified CAN TX request pool size"
+        default 16
+        range 1 256
+        help
+            Number of preallocated TX request descriptors shared by blocking,
+            non-blocking and ISR-originated transmissions.
 
     config RT_CAN_NB_TX_FIFO_SIZE
-        int "Non-blocking send buffer size (in bytes)"
+        int "Legacy non-blocking send buffer size (in bytes)"
         default 256
         help
-            This defines the size of the software ring buffer used for
-            non-blocking and ISR-based transmissions. When the hardware
-            mailboxes are full, outgoing messages are temporarily stored
-            in this buffer.
-
-            To calculate a suitable size, use:
-            (number of messages to buffer) * sizeof(struct rt_can_msg).
-            For standard CAN, sizeof(struct rt_can_msg) is typically 16 bytes.
-            The default of 256 bytes can buffer 16 standard CAN messages.
-            If using CAN-FD, you will need to increase this size significantly.
+            Kept for source/configuration compatibility while the unified TX
+            request pool replaces nb_tx_rb as the correctness mechanism.
 
     config RT_CAN_MALLOC_NB_TX_BUFFER
-        bool "Dynamically allocate the non-blocking send buffer"
+        bool "Dynamically allocate the legacy non-blocking send buffer"
         depends on RT_USING_HEAP
         default n
         help
-            If this option is enabled (y), the non-blocking send buffer will
-            be allocated from the system heap at runtime when the CAN device
-            is opened (using rt_malloc). This saves static RAM but requires
-            a heap to be available.
-
-            If this option is disabled (n), the buffer will be allocated
-            as a static array within the rt_can_device structure. This
-            consumes static RAM but guarantees the memory is always available
-            and avoids heap fragmentation.
+            Compatibility option retained during the refactor stack.
 
 endif
 

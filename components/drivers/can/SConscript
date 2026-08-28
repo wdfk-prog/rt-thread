@@ -4,10 +4,13 @@ cwd     = GetCurrentDir()
 src     = Glob('*.c')
 CPPPATH = [cwd + '/../include']
 
+# Keep the legacy source in-tree while the refactor stack is reviewable.
+SrcRemove(src, ['dev_can.c'])
+
 if not GetDepend('RT_USING_DM'):
     SrcRemove(src, ['can_dm.c'])
 
-group   = DefineGroup('DeviceDrivers', src, depend = ['RT_USING_CAN'], CPPPATH = CPPPATH)
+group = DefineGroup('DeviceDrivers', src, depend = ['RT_USING_CAN'], CPPPATH = CPPPATH)
 
 if GetDepend('RT_USING_UTESTCASES'):
     group = group + SConscript('utest/SConscript')
