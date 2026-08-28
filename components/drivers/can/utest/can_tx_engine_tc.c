@@ -16,6 +16,7 @@ static rt_uint32_t _callback_count;
 static rt_err_t _callback_result;
 static volatile rt_bool_t _blocking_done;
 static rt_uint32_t _fake_caps;
+static rt_uint32_t _abort_count;
 
 static rt_err_t _fake_configure(struct rt_can_device *can, struct can_configure *cfg)
 {
@@ -26,10 +27,16 @@ static rt_err_t _fake_configure(struct rt_can_device *can, struct can_configure 
 
 static rt_err_t _fake_control(struct rt_can_device *can, int cmd, void *arg)
 {
-    RT_UNUSED(can);
     if (cmd == RT_CAN_CMD_GET_CAPABILITIES && arg != RT_NULL)
     {
         *(rt_uint32_t *)arg = _fake_caps;
+        return RT_EOK;
+    }
+    if (cmd == RT_CAN_CMD_ABORT_TX)
+    {
+        rt_uint32_t mailbox = (rt_uint32_t)(rt_ubase_t)arg;
+        _abort_count++;
+        rt_hw_can_isr(can, RT_CAN_EVENT_TX_FAIL | (mailbox << 8));
         return RT_EOK;
     }
     return RT_EOK;
@@ -197,6 +204,38 @@ static void can_tx_strict_order_tc(void)
     rt_hw_can_isr(&_fake_can, RT_CAN_EVENT_TX_DONE | (_last_mailbox << 8));
 }
 
+static void can_tx_quiesce_abort_tc(void)
+{
+    struct rt_can_msg msgs[2] = {0};
+    struct rt_can_msg after = {0};
+    rt_uint32_t before;
+
+    _abort_count = 0;
+    msgs[0].id = 0x401;
+    msgs[0].ide = RT_CAN_STDID;
+    msgs[0].rtr = RT_CAN_DTR;
+    msgs[0].len = 1;
+    msgs[0].nonblocking = 1;
+    msgs[1] = msgs[0];
+    msgs[1].id = 0x402;
+
+    uassert_int_equal(rt_device_write((rt_device_t)&_fake_can, 0, msgs, sizeof(msgs)), sizeof(msgs));
+    before = _submit_count;
+    uassert_int_equal(rt_can_quiesce(&_fake_can, RT_CAN_QUIESCE_ABORT_ALL, 20), RT_EOK);
+    uassert_int_equal(_abort_count, 1);
+    uassert_int_equal(_submit_count, before);
+    uassert_int_equal(rt_can_tx_resume(&_fake_can), RT_EOK);
+
+    after.id = 0x403;
+    after.ide = RT_CAN_STDID;
+    after.rtr = RT_CAN_DTR;
+    after.len = 1;
+    after.nonblocking = 1;
+    uassert_int_equal(rt_device_write((rt_device_t)&_fake_can, 0, &after, sizeof(after)), sizeof(after));
+    uassert_int_equal(_submit_count, before + 1);
+    rt_hw_can_isr(&_fake_can, RT_CAN_EVENT_TX_DONE | (_last_mailbox << 8));
+}
+
 static rt_err_t utest_tc_init(void)
 {
     rt_err_t ret;
@@ -209,7 +248,8 @@ static rt_err_t utest_tc_init(void)
     _submit_count = 0;
     _last_mailbox = 0;
     _last_id = 0;
-    _fake_caps = 0;
+    _fake_caps = RT_CAN_CAP_TX_ABORT;
+    _abort_count = 0;
 
     ret = rt_hw_can_register(&_fake_can, "cantx0", &_fake_ops, RT_NULL);
     if (ret != RT_EOK)
@@ -231,6 +271,7 @@ static void testcase(void)
     UTEST_UNIT_RUN(can_tx_callback_once_tc);
     UTEST_UNIT_RUN(can_tx_timeout_keeps_owner_tc);
     UTEST_UNIT_RUN(can_tx_strict_order_tc);
+    UTEST_UNIT_RUN(can_tx_quiesce_abort_tc);
 }
 
 UTEST_TC_EXPORT(testcase, "components.drivers.can.tx_engine",

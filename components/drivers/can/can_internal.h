@@ -17,8 +17,11 @@ enum rt_can_tx_req_state
     RT_CAN_TX_REQ_QUEUED,
     RT_CAN_TX_REQ_SUBMITTING,
     RT_CAN_TX_REQ_HW_PENDING,
+    RT_CAN_TX_REQ_ABORTING,
     RT_CAN_TX_REQ_DONE,
     RT_CAN_TX_REQ_ERROR,
+    RT_CAN_TX_REQ_ABORTED,
+    RT_CAN_TX_REQ_CANCELLED,
 };
 
 struct rt_can_tx_request
@@ -39,6 +42,7 @@ struct rt_can_runtime
 {
     struct rt_can_core core;
     rt_uint32_t capabilities;
+    enum rt_can_quiesce_policy quiesce_policy;
 };
 
 static rt_inline struct rt_can_runtime *rt_can_runtime_get(struct rt_can_device *can)
@@ -51,6 +55,7 @@ void rt_can_tx_runtime_deinit(struct rt_can_runtime *runtime);
 rt_ssize_t rt_can_tx_write_core(struct rt_can_device *can, const struct rt_can_msg *msg,
                                 rt_size_t size, rt_bool_t blocking);
 void rt_can_tx_isr_core(struct rt_can_device *can, int event);
+void rt_can_tx_schedule_core(struct rt_can_device *can);
 rt_err_t rt_can_tx_submit_async_core(struct rt_can_device *can, const struct rt_can_msg *msg,
                                      rt_can_tx_done_cb callback, void *arg);
 

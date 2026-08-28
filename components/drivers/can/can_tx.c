@@ -18,7 +18,8 @@ struct tx_notify
 
 static rt_bool_t _tx_terminal(enum rt_can_tx_req_state state)
 {
-    return state == RT_CAN_TX_REQ_DONE || state == RT_CAN_TX_REQ_ERROR;
+    return state == RT_CAN_TX_REQ_DONE || state == RT_CAN_TX_REQ_ERROR ||
+           state == RT_CAN_TX_REQ_ABORTED || state == RT_CAN_TX_REQ_CANCELLED;
 }
 
 static void _tx_release_locked(struct rt_can_tx_core *tx, struct rt_can_tx_request *req)
@@ -86,6 +87,7 @@ static rt_int16_t _tx_find_mailbox_locked(struct rt_can_device *can,
 
 static rt_bool_t _tx_mark_terminal_locked(struct rt_can_tx_core *tx,
                                           struct rt_can_tx_request *req,
+                                          enum rt_can_tx_req_state terminal_state,
                                           rt_err_t result,
                                           struct tx_notify *notify)
 {
@@ -96,9 +98,11 @@ static rt_bool_t _tx_mark_terminal_locked(struct rt_can_tx_core *tx,
         tx->mailbox_owner[req->mailbox] == req)
         tx->mailbox_owner[req->mailbox] = RT_NULL;
 
+    if (!rt_list_isempty(&req->node))
+        rt_list_remove(&req->node);
     req->mailbox = -1;
     req->result = result;
-    req->state = result == RT_EOK ? RT_CAN_TX_REQ_DONE : RT_CAN_TX_REQ_ERROR;
+    req->state = terminal_state;
 
     notify->req = req;
     notify->result = result;
@@ -161,7 +165,9 @@ static void _tx_schedule(struct rt_can_device *can)
         rt_ssize_t ret;
 
         level = rt_spin_lock_irqsave(&tx->lock);
-        if (runtime->core.lifecycle_state != RT_CAN_LC_RUNNING ||
+        if ((runtime->core.lifecycle_state != RT_CAN_LC_RUNNING &&
+             !(runtime->core.lifecycle_state == RT_CAN_LC_QUIESCING &&
+               runtime->quiesce_policy == RT_CAN_QUIESCE_DRAIN)) ||
             rt_list_isempty(&tx->pending_list))
         {
             tx->scheduling = RT_FALSE;
@@ -199,7 +205,7 @@ static void _tx_schedule(struct rt_can_device *can)
             continue;
         }
 
-        _tx_mark_terminal_locked(tx, req, (rt_err_t)ret, &notify);
+        _tx_mark_terminal_locked(tx, req, RT_CAN_TX_REQ_ERROR, (rt_err_t)ret, &notify);
         can->status.dropedsndpkg++;
         rt_spin_unlock_irqrestore(&tx->lock, level);
         _tx_notify(can, &notify);
@@ -263,6 +269,7 @@ static rt_ssize_t _tx_submit_one(struct rt_can_device *can,
     wait_ret = rt_completion_wait(&req->completion, RT_CANSND_MSG_TIMEOUT);
     if (wait_ret != RT_EOK)
     {
+        /* A caller timeout only detaches the waiter; hardware ownership stays. */
         level = rt_spin_lock_irqsave(&tx->lock);
         if (!_tx_terminal(req->state))
         {
@@ -331,6 +338,176 @@ rt_err_t rt_can_send_async(struct rt_can_device *can,
     return rt_can_tx_submit_async_core(can, msg, callback, arg);
 }
 
+static rt_bool_t _tx_idle_locked(struct rt_can_tx_core *tx)
+{
+    rt_uint16_t i;
+
+    if (!rt_list_isempty(&tx->pending_list) || tx->scheduling)
+        return RT_FALSE;
+    for (i = 0; i < tx->mailbox_count; i++)
+    {
+        if (tx->mailbox_owner[i] != RT_NULL)
+            return RT_FALSE;
+    }
+    return RT_TRUE;
+}
+
+static void _tx_cancel_queued(struct rt_can_device *can)
+{
+    struct rt_can_runtime *runtime = rt_can_runtime_get(can);
+    struct rt_can_tx_core *tx = &runtime->core.tx;
+
+    for (;;)
+    {
+        struct rt_can_tx_request *req;
+        struct tx_notify notify = {0};
+        rt_base_t level = rt_spin_lock_irqsave(&tx->lock);
+
+        if (rt_list_isempty(&tx->pending_list))
+        {
+            rt_spin_unlock_irqrestore(&tx->lock, level);
+            return;
+        }
+        req = rt_list_entry(tx->pending_list.next, struct rt_can_tx_request, node);
+        _tx_mark_terminal_locked(tx, req, RT_CAN_TX_REQ_CANCELLED, -RT_ERROR, &notify);
+        rt_spin_unlock_irqrestore(&tx->lock, level);
+        _tx_notify(can, &notify);
+    }
+}
+
+static void _tx_abort_owned(struct rt_can_device *can)
+{
+    struct rt_can_runtime *runtime = rt_can_runtime_get(can);
+    struct rt_can_tx_core *tx = &runtime->core.tx;
+    rt_uint16_t i;
+
+    if (!(runtime->capabilities & RT_CAN_CAP_TX_ABORT) || can->ops->control == RT_NULL)
+        return;
+
+    for (i = 0; i < tx->mailbox_count; i++)
+    {
+        struct rt_can_tx_request *req;
+        rt_base_t level = rt_spin_lock_irqsave(&tx->lock);
+
+        req = tx->mailbox_owner[i];
+        if (req != RT_NULL && req->state == RT_CAN_TX_REQ_HW_PENDING)
+            req->state = RT_CAN_TX_REQ_ABORTING;
+        else
+            req = RT_NULL;
+        rt_spin_unlock_irqrestore(&tx->lock, level);
+
+        if (req != RT_NULL)
+        {
+            /*
+             * A successful abort request is not itself terminal. The driver
+             * must later report TX_DONE/TX_FAIL for this mailbox; ABORTING is
+             * retired exactly once by the common terminal path.
+             */
+            if (can->ops->control(can, RT_CAN_CMD_ABORT_TX,
+                                  (void *)(rt_ubase_t)i) != RT_EOK)
+            {
+                level = rt_spin_lock_irqsave(&tx->lock);
+                if (req->state == RT_CAN_TX_REQ_ABORTING)
+                    req->state = RT_CAN_TX_REQ_HW_PENDING;
+                rt_spin_unlock_irqrestore(&tx->lock, level);
+            }
+        }
+    }
+}
+
+rt_err_t rt_can_quiesce(struct rt_can_device *can,
+                        enum rt_can_quiesce_policy policy,
+                        rt_tick_t timeout)
+{
+    struct rt_can_runtime *runtime;
+    struct rt_can_tx_core *tx;
+    rt_tick_t start;
+    rt_base_t level;
+    rt_err_t ret = RT_EOK;
+
+    if (can == RT_NULL || rt_interrupt_get_nest() > 0)
+        return -RT_EINVAL;
+    runtime = rt_can_runtime_get(can);
+    if (runtime == RT_NULL)
+        return -RT_EINVAL;
+
+    rt_mutex_take(&runtime->core.lifecycle_lock, RT_WAITING_FOREVER);
+    tx = &runtime->core.tx;
+    level = rt_spin_lock_irqsave(&tx->lock);
+    if (runtime->core.lifecycle_state != RT_CAN_LC_RUNNING)
+    {
+        rt_spin_unlock_irqrestore(&tx->lock, level);
+        rt_mutex_release(&runtime->core.lifecycle_lock);
+        return -RT_EBUSY;
+    }
+    runtime->quiesce_policy = policy;
+    runtime->core.lifecycle_state = RT_CAN_LC_QUIESCING;
+    rt_spin_unlock_irqrestore(&tx->lock, level);
+
+    if (policy == RT_CAN_QUIESCE_DRAIN)
+        _tx_schedule(can);
+    else
+        _tx_cancel_queued(can);
+    if (policy == RT_CAN_QUIESCE_ABORT_ALL)
+        _tx_abort_owned(can);
+
+    start = rt_tick_get();
+    for (;;)
+    {
+        rt_bool_t idle;
+
+        level = rt_spin_lock_irqsave(&tx->lock);
+        idle = _tx_idle_locked(tx);
+        if (idle)
+            runtime->core.lifecycle_state = RT_CAN_LC_QUIESCED;
+        rt_spin_unlock_irqrestore(&tx->lock, level);
+        if (idle)
+            break;
+        if (timeout != RT_WAITING_FOREVER && (rt_tick_get() - start) >= timeout)
+        {
+            ret = -RT_ETIMEOUT;
+            break;
+        }
+        rt_thread_mdelay(1);
+    }
+
+    rt_mutex_release(&runtime->core.lifecycle_lock);
+    return ret;
+}
+
+rt_err_t rt_can_tx_resume(struct rt_can_device *can)
+{
+    struct rt_can_runtime *runtime;
+    struct rt_can_tx_core *tx;
+    rt_base_t level;
+
+    if (can == RT_NULL || rt_interrupt_get_nest() > 0)
+        return -RT_EINVAL;
+    runtime = rt_can_runtime_get(can);
+    if (runtime == RT_NULL)
+        return -RT_EINVAL;
+
+    rt_mutex_take(&runtime->core.lifecycle_lock, RT_WAITING_FOREVER);
+    tx = &runtime->core.tx;
+    level = rt_spin_lock_irqsave(&tx->lock);
+    if (runtime->core.lifecycle_state != RT_CAN_LC_QUIESCED)
+    {
+        rt_spin_unlock_irqrestore(&tx->lock, level);
+        rt_mutex_release(&runtime->core.lifecycle_lock);
+        return -RT_EBUSY;
+    }
+    runtime->core.lifecycle_state = RT_CAN_LC_RUNNING;
+    rt_spin_unlock_irqrestore(&tx->lock, level);
+    rt_mutex_release(&runtime->core.lifecycle_lock);
+    _tx_schedule(can);
+    return RT_EOK;
+}
+
+void rt_can_tx_schedule_core(struct rt_can_device *can)
+{
+    _tx_schedule(can);
+}
+
 rt_err_t rt_can_tx_runtime_init(struct rt_can_device *can, struct rt_can_runtime *runtime)
 {
     struct rt_can_tx_core *tx = &runtime->core.tx;
@@ -366,6 +543,7 @@ rt_err_t rt_can_tx_runtime_init(struct rt_can_device *can, struct rt_can_runtime
         rt_list_insert_before(&tx->free_list, &tx->requests[i].node);
     }
     runtime->capabilities = 0;
+    runtime->quiesce_policy = RT_CAN_QUIESCE_DRAIN;
     if (can->ops->control != RT_NULL)
         can->ops->control(can, RT_CAN_CMD_GET_CAPABILITIES, &runtime->capabilities);
 
@@ -407,12 +585,16 @@ void rt_can_tx_isr_core(struct rt_can_device *can, int event)
     req = tx->mailbox_owner[mailbox];
     if (req == RT_NULL)
     {
+        /* Stale or duplicate completion: it cannot affect a new request. */
         rt_spin_unlock_irqrestore(&tx->lock, level);
         return;
     }
 
     result = ((event & 0xff) == RT_CAN_EVENT_TX_DONE) ? RT_EOK : -RT_ERROR;
-    if (!_tx_mark_terminal_locked(tx, req, result, &notify))
+    if (!_tx_mark_terminal_locked(tx, req,
+                                  req->state == RT_CAN_TX_REQ_ABORTING ? RT_CAN_TX_REQ_ABORTED :
+                                  (result == RT_EOK ? RT_CAN_TX_REQ_DONE : RT_CAN_TX_REQ_ERROR),
+                                  result, &notify))
     {
         rt_spin_unlock_irqrestore(&tx->lock, level);
         return;

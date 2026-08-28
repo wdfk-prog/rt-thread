@@ -228,6 +228,21 @@ static rt_err_t rt_can_control(struct rt_device *dev, int cmd, void *args)
         can->status_indicate.ind = ((rt_can_status_ind_type_t)args)->ind;
         can->status_indicate.args = ((rt_can_status_ind_type_t)args)->args;
         break;
+    case RT_CAN_CMD_FLUSH_TX:
+        ret = rt_can_quiesce(can, RT_CAN_QUIESCE_ABORT_ALL, RT_CANSND_MSG_TIMEOUT);
+        break;
+    case RT_CAN_CMD_RESUME_TX:
+        ret = rt_can_tx_resume(can);
+        break;
+    case RT_CAN_CMD_SET_BAUD:
+        ret = rt_can_quiesce(can, RT_CAN_QUIESCE_ABORT_ALL, RT_CANSND_MSG_TIMEOUT);
+        if (ret == RT_EOK)
+        {
+            ret = can->ops->control ? can->ops->control(can, cmd, args) : -RT_ENOSYS;
+            if (ret == RT_EOK)
+                ret = rt_can_tx_resume(can);
+        }
+        break;
 #ifdef RT_CAN_USING_HDR
     case RT_CAN_CMD_SET_FILTER:
         ret = can->ops->control(can, cmd, args);
