@@ -5,6 +5,17 @@
 
 #include "can_internal.h"
 
+struct tx_notify
+{
+    struct rt_can_tx_request *req;
+    rt_bool_t wake_waiter;
+    rt_bool_t auto_release;
+    rt_can_tx_done_cb callback;
+    void *callback_arg;
+    struct rt_can_msg msg;
+    rt_err_t result;
+};
+
 static rt_bool_t _tx_terminal(enum rt_can_tx_req_state state)
 {
     return state == RT_CAN_TX_REQ_DONE || state == RT_CAN_TX_REQ_ERROR;
@@ -16,6 +27,9 @@ static void _tx_release_locked(struct rt_can_tx_core *tx, struct rt_can_tx_reque
     req->result = RT_EOK;
     req->mailbox = -1;
     req->blocking = RT_FALSE;
+    req->waiter_attached = RT_FALSE;
+    req->callback = RT_NULL;
+    req->callback_arg = RT_NULL;
     rt_list_insert_before(&tx->free_list, &req->node);
 }
 
@@ -25,12 +39,13 @@ static struct rt_can_tx_request *_tx_alloc_locked(struct rt_can_tx_core *tx)
 
     if (rt_list_isempty(&tx->free_list))
         return RT_NULL;
-
     req = rt_list_entry(tx->free_list.next, struct rt_can_tx_request, node);
     rt_list_remove(&req->node);
     req->state = RT_CAN_TX_REQ_QUEUED;
     req->result = RT_EOK;
     req->mailbox = -1;
+    req->callback = RT_NULL;
+    req->callback_arg = RT_NULL;
     return req;
 }
 
@@ -47,13 +62,62 @@ static rt_int16_t _tx_find_mailbox_locked(struct rt_can_device *can,
         return tx->mailbox_owner[req->msg.priv] == RT_NULL ?
                (rt_int16_t)req->msg.priv : -1;
     }
-
     for (i = 0; i < tx->mailbox_count; i++)
     {
         if (tx->mailbox_owner[i] == RT_NULL)
             return (rt_int16_t)i;
     }
     return -1;
+}
+
+static rt_bool_t _tx_mark_terminal_locked(struct rt_can_tx_core *tx,
+                                          struct rt_can_tx_request *req,
+                                          rt_err_t result,
+                                          struct tx_notify *notify)
+{
+    if (_tx_terminal(req->state) || req->state == RT_CAN_TX_REQ_FREE)
+        return RT_FALSE;
+
+    if (req->mailbox >= 0 && req->mailbox < tx->mailbox_count &&
+        tx->mailbox_owner[req->mailbox] == req)
+        tx->mailbox_owner[req->mailbox] = RT_NULL;
+
+    req->mailbox = -1;
+    req->result = result;
+    req->state = result == RT_EOK ? RT_CAN_TX_REQ_DONE : RT_CAN_TX_REQ_ERROR;
+
+    notify->req = req;
+    notify->result = result;
+    notify->wake_waiter = req->blocking && req->waiter_attached;
+    notify->auto_release = !req->blocking || !req->waiter_attached;
+    notify->callback = req->callback;
+    notify->callback_arg = req->callback_arg;
+    notify->msg = req->msg;
+    return RT_TRUE;
+}
+
+static void _tx_notify(struct rt_can_device *can, struct tx_notify *notify)
+{
+    struct rt_can_runtime *runtime = rt_can_runtime_get(can);
+    struct rt_can_tx_core *tx;
+    rt_base_t level;
+
+    if (notify->req == RT_NULL || runtime == RT_NULL)
+        return;
+    tx = &runtime->core.tx;
+
+    if (notify->wake_waiter)
+        rt_completion_done(&notify->req->completion);
+    if (notify->callback)
+        notify->callback(can, &notify->msg, notify->result, notify->callback_arg);
+
+    if (notify->auto_release)
+    {
+        level = rt_spin_lock_irqsave(&tx->lock);
+        if (_tx_terminal(notify->req->state))
+            _tx_release_locked(tx, notify->req);
+        rt_spin_unlock_irqrestore(&tx->lock, level);
+    }
 }
 
 static void _tx_schedule(struct rt_can_device *can)
@@ -64,8 +128,8 @@ static void _tx_schedule(struct rt_can_device *can)
 
     if (runtime == RT_NULL || can->ops->sendmsg == RT_NULL)
         return;
-
     tx = &runtime->core.tx;
+
     level = rt_spin_lock_irqsave(&tx->lock);
     if (tx->scheduling)
     {
@@ -78,9 +142,9 @@ static void _tx_schedule(struct rt_can_device *can)
     for (;;)
     {
         struct rt_can_tx_request *req;
+        struct tx_notify notify = {0};
         rt_int16_t mailbox;
         rt_ssize_t ret;
-        rt_bool_t wake = RT_FALSE;
 
         level = rt_spin_lock_irqsave(&tx->lock);
         if (runtime->core.lifecycle_state != RT_CAN_LC_RUNNING ||
@@ -106,11 +170,6 @@ static void _tx_schedule(struct rt_can_device *can)
         tx->mailbox_owner[mailbox] = req;
         rt_spin_unlock_irqrestore(&tx->lock, level);
 
-        /*
-         * Unified driver contract: when non-blocking TX is enabled, sendmsg()
-         * is an ISR-safe, non-sleeping hardware submit operation for the
-         * framework-selected mailbox.
-         */
         ret = can->ops->sendmsg(can, &req->msg, (rt_uint32_t)mailbox);
 
         level = rt_spin_lock_irqsave(&tx->lock);
@@ -126,22 +185,42 @@ static void _tx_schedule(struct rt_can_device *can)
             continue;
         }
 
-        if (tx->mailbox_owner[mailbox] == req)
-            tx->mailbox_owner[mailbox] = RT_NULL;
-        req->mailbox = -1;
-        req->result = (rt_err_t)ret;
-        req->state = RT_CAN_TX_REQ_ERROR;
-        if (req->blocking)
-            wake = RT_TRUE;
-        else
-        {
-            _tx_release_locked(tx, req);
-            can->status.dropedsndpkg++;
-        }
+        _tx_mark_terminal_locked(tx, req, (rt_err_t)ret, &notify);
+        can->status.dropedsndpkg++;
         rt_spin_unlock_irqrestore(&tx->lock, level);
-        if (wake)
-            rt_completion_done(&req->completion);
+        _tx_notify(can, &notify);
     }
+}
+
+static struct rt_can_tx_request *_tx_enqueue(struct rt_can_device *can,
+                                             const struct rt_can_msg *msg,
+                                             rt_bool_t blocking,
+                                             rt_can_tx_done_cb callback,
+                                             void *callback_arg)
+{
+    struct rt_can_runtime *runtime = rt_can_runtime_get(can);
+    struct rt_can_tx_core *tx;
+    struct rt_can_tx_request *req;
+    rt_base_t level;
+
+    if (runtime == RT_NULL || runtime->core.lifecycle_state != RT_CAN_LC_RUNNING)
+        return RT_NULL;
+    tx = &runtime->core.tx;
+
+    level = rt_spin_lock_irqsave(&tx->lock);
+    req = _tx_alloc_locked(tx);
+    if (req)
+    {
+        req->msg = *msg;
+        req->blocking = blocking;
+        req->waiter_attached = blocking;
+        req->callback = callback;
+        req->callback_arg = callback_arg;
+        rt_completion_init(&req->completion);
+        rt_list_insert_before(&tx->pending_list, &req->node);
+    }
+    rt_spin_unlock_irqrestore(&tx->lock, level);
+    return req;
 }
 
 static rt_ssize_t _tx_submit_one(struct rt_can_device *can,
@@ -155,49 +234,40 @@ static rt_ssize_t _tx_submit_one(struct rt_can_device *can,
     rt_err_t wait_ret;
     rt_err_t result;
 
-    if (runtime == RT_NULL || runtime->core.lifecycle_state != RT_CAN_LC_RUNNING)
-        return -RT_EBUSY;
-
-    tx = &runtime->core.tx;
-    level = rt_spin_lock_irqsave(&tx->lock);
-    req = _tx_alloc_locked(tx);
+    req = _tx_enqueue(can, msg, blocking, RT_NULL, RT_NULL);
     if (req == RT_NULL)
     {
         can->status.dropedsndpkg++;
-        rt_spin_unlock_irqrestore(&tx->lock, level);
         return -RT_EFULL;
     }
-
-    req->msg = *msg;
-    req->blocking = blocking;
-    rt_completion_init(&req->completion);
-    rt_list_insert_before(&tx->pending_list, &req->node);
-    rt_spin_unlock_irqrestore(&tx->lock, level);
-
+    tx = &runtime->core.tx;
     _tx_schedule(can);
+
     if (!blocking)
         return sizeof(struct rt_can_msg);
 
     wait_ret = rt_completion_wait(&req->completion, RT_CANSND_MSG_TIMEOUT);
     if (wait_ret != RT_EOK)
     {
-        /* PR3 changes timeout to detach the waiter without retiring ownership. */
         level = rt_spin_lock_irqsave(&tx->lock);
         if (!_tx_terminal(req->state))
         {
-            if (req->mailbox >= 0 && tx->mailbox_owner[req->mailbox] == req)
-                tx->mailbox_owner[req->mailbox] = RT_NULL;
-            if (!rt_list_isempty(&req->node))
-                rt_list_remove(&req->node);
-            _tx_release_locked(tx, req);
+            req->waiter_attached = RT_FALSE;
+            rt_spin_unlock_irqrestore(&tx->lock, level);
+            can->status.dropedsndpkg++;
+            return wait_ret;
         }
         rt_spin_unlock_irqrestore(&tx->lock, level);
-        can->status.dropedsndpkg++;
-        return wait_ret;
     }
 
     level = rt_spin_lock_irqsave(&tx->lock);
+    if (!_tx_terminal(req->state))
+    {
+        rt_spin_unlock_irqrestore(&tx->lock, level);
+        return wait_ret;
+    }
     result = req->result;
+    req->waiter_attached = RT_FALSE;
     _tx_release_locked(tx, req);
     rt_spin_unlock_irqrestore(&tx->lock, level);
 
@@ -226,6 +296,27 @@ rt_ssize_t rt_can_tx_write_core(struct rt_can_device *can, const struct rt_can_m
     return done;
 }
 
+rt_err_t rt_can_tx_submit_async_core(struct rt_can_device *can,
+                                     const struct rt_can_msg *msg,
+                                     rt_can_tx_done_cb callback,
+                                     void *arg)
+{
+    if (can == RT_NULL || msg == RT_NULL)
+        return -RT_EINVAL;
+    if (_tx_enqueue(can, msg, RT_FALSE, callback, arg) == RT_NULL)
+        return -RT_EFULL;
+    _tx_schedule(can);
+    return RT_EOK;
+}
+
+rt_err_t rt_can_send_async(struct rt_can_device *can,
+                           const struct rt_can_msg *msg,
+                           rt_can_tx_done_cb callback,
+                           void *arg)
+{
+    return rt_can_tx_submit_async_core(can, msg, callback, arg);
+}
+
 rt_err_t rt_can_tx_runtime_init(struct rt_can_device *can, struct rt_can_runtime *runtime)
 {
     struct rt_can_tx_core *tx = &runtime->core.tx;
@@ -235,7 +326,6 @@ rt_err_t rt_can_tx_runtime_init(struct rt_can_device *can, struct rt_can_runtime
     ret = rt_can_core_init(&runtime->core, "canlc");
     if (ret != RT_EOK)
         return ret;
-
     tx->request_count = RT_CAN_TX_REQUEST_COUNT;
     tx->mailbox_count = (rt_uint16_t)can->config.sndboxnumber;
     if (tx->mailbox_count == 0)
@@ -245,7 +335,6 @@ rt_err_t rt_can_tx_runtime_init(struct rt_can_device *can, struct rt_can_runtime
                                                          sizeof(struct rt_can_tx_request));
     if (tx->requests == RT_NULL)
         goto __nomem;
-
     tx->mailbox_owner = (struct rt_can_tx_request **)rt_calloc(tx->mailbox_count,
                                                               sizeof(struct rt_can_tx_request *));
     if (tx->mailbox_owner == RT_NULL)
@@ -254,7 +343,6 @@ rt_err_t rt_can_tx_runtime_init(struct rt_can_device *can, struct rt_can_runtime
         tx->requests = RT_NULL;
         goto __nomem;
     }
-
     for (i = 0; i < tx->request_count; i++)
     {
         tx->requests[i].state = RT_CAN_TX_REQ_FREE;
@@ -275,7 +363,6 @@ void rt_can_tx_runtime_deinit(struct rt_can_runtime *runtime)
 {
     if (runtime == RT_NULL)
         return;
-
     runtime->core.lifecycle_state = RT_CAN_LC_STOPPED;
     rt_free(runtime->core.tx.mailbox_owner);
     rt_free(runtime->core.tx.requests);
@@ -287,9 +374,10 @@ void rt_can_tx_isr_core(struct rt_can_device *can, int event)
     struct rt_can_runtime *runtime = rt_can_runtime_get(can);
     struct rt_can_tx_core *tx;
     struct rt_can_tx_request *req;
+    struct tx_notify notify = {0};
     rt_uint32_t mailbox = (rt_uint32_t)event >> 8;
-    rt_bool_t blocking;
     rt_base_t level;
+    rt_err_t result;
 
     if (runtime == RT_NULL)
         return;
@@ -305,25 +393,21 @@ void rt_can_tx_isr_core(struct rt_can_device *can, int event)
         return;
     }
 
-    tx->mailbox_owner[mailbox] = RT_NULL;
-    req->mailbox = -1;
-    req->result = ((event & 0xff) == RT_CAN_EVENT_TX_DONE) ? RT_EOK : -RT_ERROR;
-    req->state = req->result == RT_EOK ? RT_CAN_TX_REQ_DONE : RT_CAN_TX_REQ_ERROR;
-    blocking = req->blocking;
-
-    if (!blocking)
+    result = ((event & 0xff) == RT_CAN_EVENT_TX_DONE) ? RT_EOK : -RT_ERROR;
+    if (!_tx_mark_terminal_locked(tx, req, result, &notify))
     {
-        if (req->result == RT_EOK)
+        rt_spin_unlock_irqrestore(&tx->lock, level);
+        return;
+    }
+    if (!req->blocking)
+    {
+        if (result == RT_EOK)
             can->status.sndpkg++;
         else
             can->status.dropedsndpkg++;
-        _tx_release_locked(tx, req);
     }
     rt_spin_unlock_irqrestore(&tx->lock, level);
 
-    if (blocking)
-        rt_completion_done(&req->completion);
-
-    /* TX_DONE/TX_FAIL directly advances the queue in ISR context. */
+    _tx_notify(can, &notify);
     _tx_schedule(can);
 }

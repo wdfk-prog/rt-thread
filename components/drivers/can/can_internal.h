@@ -5,6 +5,7 @@
 #include <rtthread.h>
 #include <rtdevice.h>
 #include "can_core.h"
+#include <drivers/can_tx.h>
 
 #ifndef RT_CAN_TX_REQUEST_COUNT
 #define RT_CAN_TX_REQUEST_COUNT RT_CANMSG_BOX_SZ
@@ -28,7 +29,10 @@ struct rt_can_tx_request
     rt_err_t result;
     rt_int16_t mailbox;
     rt_bool_t blocking;
+    rt_bool_t waiter_attached;
     struct rt_completion completion;
+    rt_can_tx_done_cb callback;
+    void *callback_arg;
 };
 
 struct rt_can_runtime
@@ -46,6 +50,8 @@ void rt_can_tx_runtime_deinit(struct rt_can_runtime *runtime);
 rt_ssize_t rt_can_tx_write_core(struct rt_can_device *can, const struct rt_can_msg *msg,
                                 rt_size_t size, rt_bool_t blocking);
 void rt_can_tx_isr_core(struct rt_can_device *can, int event);
+rt_err_t rt_can_tx_submit_async_core(struct rt_can_device *can, const struct rt_can_msg *msg,
+                                     rt_can_tx_done_cb callback, void *arg);
 
 rt_ssize_t rt_can_rx_read_core(struct rt_can_device *can, struct rt_can_msg *data,
                                rt_ssize_t msgs);
