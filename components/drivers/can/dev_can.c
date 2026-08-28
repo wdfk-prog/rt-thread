@@ -978,8 +978,7 @@ static rt_err_t rt_can_close(struct rt_device *dev)
     result = _can_wait_tx_submit_refcnt(can, RT_WAITING_FOREVER);
     if (result != RT_EOK)
     {
-        CAN_UNLOCK(can);
-        return result;
+        goto close_fail;
     }
 
     if (can->ops->abort_tx != RT_NULL)
@@ -996,8 +995,7 @@ static rt_err_t rt_can_close(struct rt_device *dev)
             result = can->ops->control(can, RT_CAN_CMD_START, RT_FALSE);
             if (result != RT_EOK)
             {
-                CAN_UNLOCK(can);
-                return result;
+                goto close_fail;
             }
             controller_stopped = RT_TRUE;
         }
@@ -1008,8 +1006,7 @@ static rt_err_t rt_can_close(struct rt_device *dev)
         result = can->ops->control(can, RT_CAN_CMD_START, RT_FALSE);
         if (result != RT_EOK)
         {
-            CAN_UNLOCK(can);
-            return result;
+            goto close_fail;
         }
         controller_stopped = RT_TRUE;
     }
@@ -1025,8 +1022,7 @@ static rt_err_t rt_can_close(struct rt_device *dev)
     result = _can_wait_tx_active_refcnt(can, RT_WAITING_FOREVER);
     if (result != RT_EOK)
     {
-        CAN_UNLOCK(can);
-        return result;
+        goto close_fail;
     }
 
     /*
@@ -1038,8 +1034,7 @@ static rt_err_t rt_can_close(struct rt_device *dev)
         result = can->ops->control(can, RT_CAN_CMD_START, RT_FALSE);
         if (result != RT_EOK)
         {
-            CAN_UNLOCK(can);
-            return result;
+            goto close_fail;
         }
     }
 
@@ -1104,6 +1099,20 @@ static rt_err_t rt_can_close(struct rt_device *dev)
     CAN_UNLOCK(can);
 
     return RT_EOK;
+
+close_fail:
+    /*
+     * rt_device_close() consumes the final reference before calling this driver
+     * callback. No runtime memory is released before this label, so restore that
+     * reference and keep TX disabled. The controller state may be uncertain after
+     * a failed stop; callers can retry close or explicitly recover the controller.
+     */
+    dev->ref_count++;
+    RT_ASSERT(dev->ref_count != 0);
+    rt_atomic_store(&can->tx_state, RT_CAN_TX_STATE_DISABLED);
+
+    CAN_UNLOCK(can);
+    return result;
 }
 
 static rt_ssize_t rt_can_read(struct rt_device *dev,
