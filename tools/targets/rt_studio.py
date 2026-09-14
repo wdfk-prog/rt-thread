@@ -201,7 +201,7 @@ project_temp = """<?xml version="1.0" encoding="UTF-8"?>
     </buildSpec>
     <natures>
         <nature>org.eclipse.cdt.core.cnature</nature>
-        <nature>org.rt-thread.studio.rttnature</nature>
+__cpp_nature_flag__        <nature>org.rt-thread.studio.rttnature</nature>
         <nature>org.eclipse.cdt.managedbuilder.core.managedBuildNature</nature>
         <nature>org.eclipse.cdt.managedbuilder.core.ScannerConfigNature</nature>
     </natures>
@@ -328,9 +328,25 @@ def gen_cproject_file(output_file_path):
             return False
 
 
-def gen_project_file(output_file_path):
+def _is_cpp_project_enabled(is_cpp_project=None):
+    if is_cpp_project is not None:
+        return is_cpp_project
+    if getattr(rtconfig, 'RT_USING_CPLUSPLUS', False):
+        return True
+    if os.path.exists('rtconfig.h'):
+        with open('rtconfig.h', 'r', encoding='utf-8', errors='ignore') as config_file:
+            return '#define RT_USING_CPLUSPLUS' in config_file.read()
+    return False
+
+
+def gen_project_file(output_file_path, project_name='rtthread', is_cpp_project=None):
     try:
-        w_str = project_temp
+        cpp_nature = ''
+        if _is_cpp_project_enabled(is_cpp_project):
+            cpp_nature = '        <nature>org.eclipse.cdt.core.ccnature</nature>\n'
+        w_str = project_temp.replace('__project_name_flag__', project_name)
+        w_str = w_str.replace('__cpp_nature_flag__', cpp_nature)
+
         dir_name = os.path.dirname(output_file_path)
         if not os.path.exists(dir_name):
             os.makedirs(dir_name)
@@ -338,6 +354,7 @@ def gen_project_file(output_file_path):
             f.write(w_str)
             return True
     except Exception as e:
+        print(e)
         return False
 
 
