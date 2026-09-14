@@ -4,6 +4,7 @@ import rtconfig
 
 cwd = GetCurrentDir()
 src = ['kerrno.c', 'kstdio.c', 'kstring.c']
+CPPDEFINES = []
 
 if not GetDepend(['RT_KLIBC_USING_LIBC_VSNPRINTF']):
     if GetDepend(['RT_KLIBC_USING_VSNPRINTF_STANDARD']):
@@ -14,18 +15,14 @@ if not GetDepend(['RT_KLIBC_USING_LIBC_VSNPRINTF']):
 if not GetDepend(['RT_KLIBC_USING_LIBC_VSSCANF']):
     src += ['rt_vsscanf.c']
 
-# at -O2/-Os, GCC recognises the byte loops used by rt_memset()/rt_memcpy()/
-# rt_memmove() in kstring.c and turns them into calls to memset()/memcpy()/
-# memmove(). Those symbols do not exist on targets built without a C library,
-# so the firmware fails to link (see issue #6128). Keep the loops here.
-group_args = {'depend': ['']}
-if rtconfig.CROSS_TOOL == 'gcc' and not GetOption('clang-analyzer'):
-    # Do not pass LOCAL_CFLAGS in --clang-analyzer builds: building.py replaces
-    # CFLAGS with a list there, and local_group() concatenates it with this
-    # string, which raises TypeError and stops the static analysis.
-    group_args['LOCAL_CFLAGS'] = ' -fno-tree-loop-distribute-patterns'
+if GetDepend('RT_KLIBC_USING_FULL_REPLACING_SPRINTF'):
+    CPPDEFINES += ['sprintf=rt_sprintf']
+if GetDepend('RT_KLIBC_USING_FULL_REPLACING_SNPRINTF'):
+    CPPDEFINES += ['snprintf=rt_snprintf']
+if GetDepend('RT_KLIBC_USING_FULL_REPLACING_PRINTF'):
+    CPPDEFINES += ['printf=rt_kprintf']
 
-group = DefineGroup('Libc', src, **group_args)
+group = DefineGroup('Libc', src, depend = [''], CPPDEFINES = CPPDEFINES)
 
 list = os.listdir(cwd)
 for item in list:
