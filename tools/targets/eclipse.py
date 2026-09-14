@@ -127,17 +127,17 @@ def ExcludePaths(rootpath, paths):
 
     files = os.listdir(OSPath(rootpath))
     for file in files:
-        if file.startswith('.'):
-            continue
-
         fullname = os.path.join(OSPath(rootpath), file)
 
-        if os.path.isdir(fullname):
-            # print(fullname)
-            if not fullname in paths:
-                ret = ret + [fullname]
-            else:
-                ret = ret + ExcludePaths(fullname, paths)
+        if not os.path.isdir(fullname):
+            continue
+
+        # Hidden directories may also contain source files. Keep Eclipse
+        # exclusions consistent with the directories selected by SCons.
+        if fullname not in paths:
+            ret.append(fullname)
+        else:
+            ret.extend(ExcludePaths(fullname, paths))
 
     return ret
 
@@ -174,10 +174,68 @@ def IsRttEclipseLibFormat(path):
 def IsCppProject():
     return GetDepend('RT_USING_CPLUSPLUS')
 
+def _stringify_env_flag_list(value):
+    # SCons env flags can be a string, list, or tuple depending on toolchain/bsp.
+    # Normalize them to a single whitespace-joined string for Eclipse CDT option values.
+    if value is None:
+        return ''
+    if isinstance(value, (list, tuple)):
+        return ' '.join(str(item) for item in value)
+    return str(value)
+
+def _strip_linker_script_flag(value):
+    # Eclipse/RT-Studio project templates usually set the linker script via a dedicated option
+    # (e.g. "linker.scriptfile" or "linker.option.script"). Keep "Other linker flags" clean by
+    # removing "-T <script>" from LINKFLAGS to avoid duplicated/contradictory settings.
+    items = _stringify_env_flag_list(value).split()
+    if '-T' not in items:
+        return ' '.join(items)
+
+    filtered = []
+    index = 0
+    while index < len(items):
+        if items[index] == '-T':
+            index += 2
+            continue
+        filtered.append(items[index])
+        index += 1
+    return ' '.join(filtered)
+
+
+def _write_text_if_changed(path, content, encoding='utf-8'):
+    if os.path.exists(path):
+        with open(path, 'r', encoding=encoding, errors='ignore', newline='') as existing:
+            if existing.read() == content:
+                return False
+
+    with open(path, 'w', encoding=encoding, newline='') as output:
+        output.write(content)
+    return True
+
+
+def _serialize_xml(root, xml_declaration, processing_instruction=None):
+    xml_indent(root)
+    header = xml_declaration + '\n'
+    if processing_instruction is not None:
+        header += processing_instruction
+    body = etree.tostring(root, encoding='utf-8').decode('utf-8')
+    return header + body
+
 
 def HandleToolOption(tools, env, project, reset):
-    is_cpp_prj = IsCppProject()
     BSP_ROOT = os.path.abspath(env['BSP_ROOT'])
+
+    # NOTE:
+    # Historically, the .cproject file only got CFLAGS/AFLAGS/LFLAGS injected when it was
+    # first created (rt_studio.gen_cproject_file). Subsequent "scons --target=eclipse"
+    # updates would not refresh "Other * flags", so changes in rtconfig.py (e.g. -O0/-Os)
+    # would not take effect unless the user deleted .cproject manually.
+    #
+    # Refresh the relevant Eclipse CDT option values every time we update a project.
+    asflags = _stringify_env_flag_list(env['ASFLAGS']) if 'ASFLAGS' in env else ''
+    cflags = _stringify_env_flag_list(env['CFLAGS']) if 'CFLAGS' in env else ''
+    cxxflags = _stringify_env_flag_list(env['CXXFLAGS']) if 'CXXFLAGS' in env else ''
+    linkflags = _strip_linker_script_flag(env['LINKFLAGS']) if 'LINKFLAGS' in env else ''
 
     CPPDEFINES = project['CPPDEFINES']
     paths = [ConverToRttEclipsePathFormat(RelativeProjectPath(env, os.path.normpath(i)).replace('\\', '/')) for i in project['CPPPATH']]
@@ -186,13 +244,13 @@ def HandleToolOption(tools, env, project, reset):
     assembler_include_paths_options = []
     compile_include_files_options = []
     compile_defs_options = []
-    linker_scriptfile_option = None
-    linker_script_option = None
-    linker_nostart_option = None
-    linker_libs_option = None
-    linker_paths_option = None
+    linker_scriptfile_options = []
+    linker_script_options = []
+    linker_nostart_options = []
+    linker_libs_options = []
+    linker_paths_options = []
 
-    linker_newlib_nano_option = None
+    linker_newlib_nano_options = []
 
     for tool in tools:
 
@@ -201,6 +259,20 @@ def HandleToolOption(tools, env, project, reset):
             # find all compile options
             for option in options:
                 option_id = option.get('id')
+                if option_id is None:
+                    continue
+                if option_id.find('option.assembler.other') != -1:
+                    # Keep assembler flags in sync with env['ASFLAGS'] (rtconfig.AFLAGS).
+                    option.set('value', asflags)
+                    continue
+                if option_id.find('option.c.compiler.other') != -1:
+                    # Keep C compiler flags in sync with env['CFLAGS'] (rtconfig.CFLAGS).
+                    option.set('value', cflags)
+                    continue
+                if option_id.find('option.cpp.compiler.other') != -1:
+                    # Keep C++ compiler flags in sync with env['CXXFLAGS'] (rtconfig.CXXFLAGS).
+                    option.set('value', cxxflags)
+                    continue
                 if ('assembler.include.paths' in option_id) or ('assembler.option.includepaths' in option_id):
                     assembler_include_paths_options += [option]
                 elif ('compiler.include.paths' in  option_id) or ('compiler.option.includepaths' in  option_id) or ('compiler.tasking.include' in  option_id):
@@ -214,22 +286,26 @@ def HandleToolOption(tools, env, project, reset):
             options = tool.findall('option')
             # find all linker options
             for option in options:
-                # the project type and option type must equal
-                if is_cpp_prj != (option.get('id').find('cpp.linker') != -1):
+                option_id = option.get('id')
+                if option_id is None:
                     continue
-
+                if option_id.find('option.c.linker.other') != -1 or option_id.find('option.cpp.linker.other') != -1:
+                    # Keep "Other linker flags" in sync with env['LINKFLAGS'] (rtconfig.LFLAGS),
+                    # while avoiding duplicating "-T <script>" which is handled by dedicated options.
+                    option.set('value', linkflags)
+                    continue
                 if option.get('id').find('linker.scriptfile') != -1:
-                    linker_scriptfile_option = option
+                    linker_scriptfile_options += [option]
                 elif option.get('id').find('linker.option.script') != -1:
-                    linker_script_option = option
+                    linker_script_options += [option]
                 elif option.get('id').find('linker.nostart') != -1:
-                    linker_nostart_option = option
+                    linker_nostart_options += [option]
                 elif option.get('id').find('linker.libs') != -1:
-                    linker_libs_option = option
+                    linker_libs_options += [option]
                 elif option.get('id').find('linker.paths') != -1 and 'LIBPATH' in env:
-                    linker_paths_option = option
+                    linker_paths_options += [option]
                 elif option.get('id').find('linker.usenewlibnano') != -1:
-                    linker_newlib_nano_option = option
+                    linker_newlib_nano_options += [option]
 
     # change the inclue path
     for option in compile_include_paths_options + assembler_include_paths_options:
@@ -246,7 +322,7 @@ def HandleToolOption(tools, env, project, reset):
     # change the inclue files (default) or definitions
     for option in compile_include_files_options:
         # add '_REENT_SMALL' to CPPDEFINES when --specs=nano.specs has select
-        if linker_newlib_nano_option is not None and linker_newlib_nano_option.get('value') == 'true' and '_REENT_SMALL' not in CPPDEFINES:
+        if any(option.get('value') == 'true' for option in linker_newlib_nano_options) and '_REENT_SMALL' not in CPPDEFINES:
             CPPDEFINES += ['_REENT_SMALL']
 
         file_header = '''
@@ -259,12 +335,14 @@ def HandleToolOption(tools, env, project, reset):
 '''
         file_tail = '\n#endif /*RTCONFIG_PREINC_H__*/\n'
         rtt_pre_inc_item = '"${workspace_loc:/${ProjName}/rtconfig_preinc.h}"'
-        # save the CPPDEFINES in to rtconfig_preinc.h
-        with open('rtconfig_preinc.h', mode = 'w+') as f:
-            f.write(file_header)
-            for cppdef in CPPDEFINES:
-                f.write("#define " + cppdef.replace('=', ' ') + '\n')
-            f.write(file_tail)
+        # save the CPPDEFINES in to rtconfig_preinc.h, but avoid touching the file when
+        # the generated content is unchanged. Rewriting this header on every
+        # `scons --target=eclipse` run forces dependent sources to rebuild.
+        rtconfig_preinc_content = file_header
+        for cppdef in CPPDEFINES:
+            rtconfig_preinc_content += "#define " + cppdef.replace('=', ' ') + '\n'
+        rtconfig_preinc_content += file_tail
+        _write_text_if_changed('rtconfig_preinc.h', rtconfig_preinc_content)
         #  change the c.compiler.include.files
         files = option.findall('listOptionValue')
         find_ok = False
@@ -294,15 +372,15 @@ def HandleToolOption(tools, env, project, reset):
             for item in cproject_defs:
                 SubElement(option, 'listOptionValue', {'builtIn': 'false', 'value': item})
 
-    # update linker script config
-    if linker_scriptfile_option is not None :
-        option = linker_scriptfile_option
-        linker_script = 'link.lds'
-        items = env['LINKFLAGS'].split(' ')
-        if '-T' in items:
-            linker_script = items[items.index('-T') + 1]
-            linker_script = ConverToRttEclipsePathFormat(linker_script)
+    # update linker script config for both C and C++ linker options
+    linker_script = 'link.lds'
+    raw_linkflags = _stringify_env_flag_list(env['LINKFLAGS']) if 'LINKFLAGS' in env else ''
+    items = raw_linkflags.split(' ')
+    if '-T' in items:
+        linker_script = items[items.index('-T') + 1]
+        linker_script = ConverToRttEclipsePathFormat(linker_script)
 
+    for option in linker_scriptfile_options:
         listOptionValue = option.find('listOptionValue')
         if listOptionValue != None:
             if reset is True or IsRttEclipsePathFormat(listOptionValue.get('value')):
@@ -310,22 +388,18 @@ def HandleToolOption(tools, env, project, reset):
         else:
             SubElement(option, 'listOptionValue', {'builtIn': 'false', 'value': linker_script})
     # scriptfile in stm32cubeIDE
-    if linker_script_option is not None :
-        option = linker_script_option
-        items = env['LINKFLAGS'].split(' ')
+    for option in linker_script_options:
         if '-T' in items:
             linker_script = ConverToRttEclipsePathFormat(items[items.index('-T') + 1]).strip('"')
             option.set('value', linker_script)
     # update nostartfiles config
-    if linker_nostart_option is not None :
-        option = linker_nostart_option
-        if env['LINKFLAGS'].find('-nostartfiles') != -1:
+    for option in linker_nostart_options:
+        if raw_linkflags.find('-nostartfiles') != -1:
             option.set('value', 'true')
         else:
             option.set('value', 'false')
     # update libs
-    if linker_libs_option is not None:
-        option = linker_libs_option
+    for option in linker_libs_options:
         # remove old libs
         for item in option.findall('listOptionValue'):
             if IsRttEclipseLibFormat(item.get("value")):
@@ -345,8 +419,7 @@ def HandleToolOption(tools, env, project, reset):
                            'builtIn': 'false', 'value': formatedLib})
 
     # update lib paths
-    if linker_paths_option is not None:
-        option = linker_paths_option
+    for option in linker_paths_options:
         # remove old lib paths
         for item in option.findall('listOptionValue'):
             if IsRttEclipsePathFormat(item.get('value')):
@@ -358,113 +431,192 @@ def HandleToolOption(tools, env, project, reset):
 
     return
 
-
 def UpdateProjectStructure(env, prj_name):
-    bsp_root = env['BSP_ROOT']
-    rtt_root = env['RTT_ROOT']
+    """
+    Updates the .project file to link any external/specified folders from 
+    PROJECT_SOURCE_FOLDERS in rtconfig.py. This version correctly handles
+    all specified paths, regardless of their physical location.
+    """
+    bsp_root = os.path.abspath(env['BSP_ROOT'])
+    
+    # --- 1. Read the list of folders to be linked from rtconfig.py ---
+    folders_to_link = []
+    try:
+        import rtconfig
+        if hasattr(rtconfig, 'PROJECT_SOURCE_FOLDERS') and rtconfig.PROJECT_SOURCE_FOLDERS:
+            folders_to_link = rtconfig.PROJECT_SOURCE_FOLDERS
+    except ImportError:
+        pass # It's okay if the file or variable doesn't exist.
 
-    project = etree.parse('.project')
-    root = project.getroot()
+    if not os.path.exists('.project'):
+        print("Error: .project file not found. Cannot update.")
+        return
+        
+    project_xml = etree.parse('.project')
+    root = project_xml.getroot()
 
-    if rtt_root.startswith(bsp_root):
-        linkedResources = root.find('linkedResources')
-        if linkedResources == None:
-            linkedResources = SubElement(root, 'linkedResources')
+    # --- 2. Ensure the <linkedResources> node exists ---
+    linkedResources = root.find('linkedResources')
+    if linkedResources is None:
+        linkedResources = SubElement(root, 'linkedResources')
 
-        links = linkedResources.findall('link')
-        # delete all RT-Thread folder links
-        for link in links:
-            if link.find('name').text.startswith('rt-thread'):
-                linkedResources.remove(link)
+    # --- 3. Clean up previously managed links to prevent duplicates ---
+    managed_link_names = [os.path.basename(p) for p in folders_to_link]
+    for link in list(linkedResources.findall('link')): # Use list() to safely remove items while iterating
+        name_element = link.find('name')
+        if name_element is not None and name_element.text in managed_link_names:
+            linkedResources.remove(link)
+            print(f"Removed existing linked resource '{name_element.text}' to regenerate it.")
 
-    if prj_name:
-        name = root.find('name')
-        if name == None:
-            name = SubElement(root, 'name')
-        name.text = prj_name
+    # --- 4. Create new links for each folder specified by the user ---
+    for folder_path in folders_to_link:
+        # The link name in the IDE will be the directory's base name.
+        link_name = os.path.basename(folder_path)
+        
+        # Resolve the absolute path of the folder to be linked.
+        abs_folder_path = os.path.abspath(os.path.join(bsp_root, folder_path))
 
-    out = open('.project', 'w')
-    out.write('<?xml version="1.0" encoding="UTF-8"?>\n')
-    xml_indent(root)
-    out.write(etree.tostring(root, encoding='utf-8').decode('utf-8'))
-    out.close()
+        print(f"Creating linked resource for '{link_name}' pointing to '{abs_folder_path}'...")
+
+        # Calculate the URI relative to the Eclipse ${PROJECT_LOC} variable.
+        # This works for both internal and external folders.
+        relative_link_path = os.path.relpath(abs_folder_path, bsp_root).replace('\\', '/')
+        
+        # Use Eclipse path variables for robustness. PARENT_LOC is more standard for external folders.
+        if relative_link_path.startswith('../'):
+             # Count how many levels up
+            levels_up = relative_link_path.count('../')
+            clean_path = relative_link_path.replace('../', '')
+            location_uri = f'PARENT-{levels_up}-PROJECT_LOC/{clean_path}'
+        else:
+            location_uri = f'PROJECT_LOC/{relative_link_path}'
+            
+        link_element = SubElement(linkedResources, 'link')
+        SubElement(link_element, 'name').text = link_name
+        SubElement(link_element, 'type').text = '2' # Type 2 means a folder link.
+        SubElement(link_element, 'locationURI').text = location_uri
+
+    # --- 5. Write the updated content back to the .project file only when it changed ---
+    project_content = _serialize_xml(root, '<?xml version="1.0" encoding="UTF-8"?>')
+    _write_text_if_changed('.project', project_content)
 
     return
-
 
 def GenExcluding(env, project):
     rtt_root = os.path.abspath(env['RTT_ROOT'])
     bsp_root = os.path.abspath(env['BSP_ROOT'])
+
+    abs_source_folders = []
+    try:
+        import rtconfig
+        if hasattr(rtconfig, 'PROJECT_SOURCE_FOLDERS'):
+            for folder in rtconfig.PROJECT_SOURCE_FOLDERS:
+                abs_source_folders.append(os.path.abspath(os.path.join(bsp_root, folder)))
+    except ImportError:
+        pass
+
     coll_dirs = CollectPaths(project['DIRS'])
     all_paths_temp = [OSPath(path) for path in coll_dirs]
     all_paths = []
 
     # add used path
     for path in all_paths_temp:
-        if path.startswith(rtt_root) or path.startswith(bsp_root):
+        is_valid_path = False
+        # Check whether the path is within BSP, RTT, or any external source folder.
+        if path.lower().startswith(bsp_root.lower()) or path.lower().startswith(rtt_root.lower()):
+            is_valid_path = True
+        else:
+            for source_folder in abs_source_folders:
+                if path.lower().startswith(source_folder.lower()):
+                    is_valid_path = True
+                    break
+        
+        if is_valid_path:
             all_paths.append(path)
 
-    if bsp_root.startswith(rtt_root):
-        # bsp folder is in the RT-Thread root folder, such as the RT-Thread source code on GitHub
-        exclude_paths = ExcludePaths(rtt_root, all_paths)
-    elif rtt_root.startswith(bsp_root):
-        # RT-Thread root folder is in the bsp folder, such as project folder which generate by 'scons --dist' cmd
-        check_path = []
-        exclude_paths = []
-        # analyze the primary folder which relative to BSP_ROOT and in all_paths
-        for path in all_paths:
-            if path.startswith(bsp_root):
-                folders = RelativeProjectPath(env, path).split('\\')
-                if folders[0] != '.' and '\\' + folders[0] not in check_path:
-                    check_path += ['\\' + folders[0]]
-        # exclue the folder which has managed by scons
-        for path in check_path:
-            exclude_paths += ExcludePaths(bsp_root + path, all_paths)
-    else:
-        exclude_paths = ExcludePaths(rtt_root, all_paths)
-        exclude_paths += ExcludePaths(bsp_root, all_paths)
 
-    paths = exclude_paths
+    # Exclude the entire unused directory to support external folders.
     exclude_paths = []
-    # remove the folder which not has source code by source_pattern
-    for path in paths:
-        # add bsp and libcpu folder and not collect source files (too more files)
+
+    # 1. Exclude unused directories under BSP ROOT
+    exclude_paths += ExcludePaths(bsp_root, all_paths)
+    
+    # 2. Exclude unused directories under RTT ROOT (if it is not within the BSP)
+    if not rtt_root.lower().startswith(bsp_root.lower()):
+        exclude_paths += ExcludePaths(rtt_root, all_paths)
+    
+    # 3. Exclude all unused directories under external folders.
+    for folder in abs_source_folders:
+        # Avoid reprocessing folders that have already been processed as RTT_ROOT.
+        if folder.lower() != rtt_root.lower():
+            exclude_paths += ExcludePaths(folder, all_paths)
+
+    # Filter out the "unused" directories that do not actually have source files.
+    filtered_exclude_paths = []
+    for path in exclude_paths:
         if path.endswith('rt-thread\\bsp') or path.endswith('rt-thread\\libcpu'):
-            exclude_paths += [path]
+            filtered_exclude_paths.append(path)
             continue
 
-        set = CollectAllFilesinPath(path, source_pattern)
-        if len(set):
-            exclude_paths += [path]
+        # Hidden directories that are not selected by SCons can be excluded
+        # directly. Avoid recursively scanning metadata trees such as .git.
+        if os.path.basename(os.path.normpath(path)).startswith('.'):
+            filtered_exclude_paths.append(path)
+            continue
 
-    exclude_paths = [RelativeProjectPath(env, path).replace('\\', '/') for path in exclude_paths]
+        if len(CollectAllFilesinPath(path, source_pattern)):
+            filtered_exclude_paths.append(path)
 
+    # Convert the path to a project relative path.
+    exclude_paths_relative = [RelativeProjectPath(env, path).replace('\\', '/') for path in filtered_exclude_paths]
+
+    # Calculate the individual files that need to be excluded.
     all_files = CollectFiles(all_paths, source_pattern)
     src_files = project['FILES']
 
     exclude_files = ExcludeFiles(all_files, src_files)
-    exclude_files = [RelativeProjectPath(env, file).replace('\\', '/') for file in exclude_files]
+    exclude_files_relative = [RelativeProjectPath(env, file).replace('\\', '/') for file in exclude_files]
 
-    env['ExPaths'] = exclude_paths
-    env['ExFiles'] = exclude_files
+    env['ExPaths'] = exclude_paths_relative
+    env['ExFiles'] = exclude_files_relative
 
-    return exclude_paths + exclude_files
-
-
+    return exclude_paths_relative + exclude_files_relative
 def RelativeProjectPath(env, path):
+
+    clean_path_str = str(path).strip().strip(',').strip('"')
+
+    try:
+        abs_path = os.path.abspath(clean_path_str)
+    except Exception:
+        return clean_path_str
+
     project_root = os.path.abspath(env['BSP_ROOT'])
+
+    # 1. Check if the path is within the project root directory (BSP_ROOT)
+    if abs_path.lower().startswith(project_root.lower()):
+        return _make_path_relative(project_root, abs_path)
+
+    # 2. Check if the path is within the RT-Thread root directory.
     rtt_root = os.path.abspath(env['RTT_ROOT'])
+    if abs_path.lower().startswith(rtt_root.lower()):
+        return 'rt-thread/' + _make_path_relative(rtt_root, abs_path)
 
-    if path.startswith(project_root):
-        return _make_path_relative(project_root, path)
+    # 3. Check the PROJECT_SOURCE_FOLDERS defined in rtconfig.py.
+    if hasattr(rtconfig, 'PROJECT_SOURCE_FOLDERS'):
+        for folder_entry in rtconfig.PROJECT_SOURCE_FOLDERS:
+            # Get the absolute path of the source folder (for example 'E:/.../lib')
+            abs_source_folder = os.path.abspath(os.path.join(project_root, folder_entry))
 
-    if path.startswith(rtt_root):
-        return 'rt-thread/' + _make_path_relative(rtt_root, path)
+            if abs_path.lower().startswith(abs_source_folder.lower()):
+                # The link name in the project is the base name of the folder path (for example, '../lib' -> 'lib')
+                link_name = os.path.basename(os.path.normpath(folder_entry))
 
-    # TODO add others folder
-    print('ERROR: the ' + path + ' not support')
+                relative_part = _make_path_relative(abs_source_folder, abs_path)
 
-    return path
+                return os.path.join(link_name, relative_part).replace('\\', '/')
+
+    print(f'WARNING: The path "{path}" could not be made relative to the project.')
+    return clean_path_str
 
 
 def HandleExcludingOption(entry, sourceEntries, excluding):
@@ -495,6 +647,80 @@ def HandleExcludingOption(entry, sourceEntries, excluding):
 
     SubElement(sourceEntries, 'entry', {'excluding': value, 'flags': 'VALUE_WORKSPACE_PATH|RESOLVED', 'kind':'sourcePath', 'name':""})
 
+def _ensure_project_nature(root, nature_text, after_text=None):
+    natures = root.find('natures')
+    if natures is None:
+        natures = SubElement(root, 'natures')
+
+    for nature in natures.findall('nature'):
+        if nature.text == nature_text:
+            return False
+
+    new_nature = etree.Element('nature')
+    new_nature.text = nature_text
+
+    insert_index = len(natures)
+    if after_text is not None:
+        for index, nature in enumerate(list(natures)):
+            if nature.text == after_text:
+                insert_index = index + 1
+                break
+    natures.insert(insert_index, new_nature)
+    return True
+
+
+def UpdateProjectName(prj_name):
+    """
+    Regardless of whether the .project file exists, make sure its name is correct.
+    """
+    try:
+        if not os.path.exists('.project'):
+            project_name = prj_name if prj_name else 'rtthread'
+            if rt_studio.gen_project_file(os.path.abspath(".project"), project_name, IsCppProject()) is False:
+                print('Fail!')
+                return
+            print("Generated .project file with name:", project_name)
+
+        project_tree = etree.parse('.project')
+        root = project_tree.getroot()
+        name_element = root.find('name')
+        changed = False
+        
+        if prj_name and name_element is not None and name_element.text != prj_name:
+            print(f"Updating project name from '{name_element.text}' to '{prj_name}'...")
+            name_element.text = prj_name
+            changed = True
+
+        if IsCppProject():
+            changed |= _ensure_project_nature(root, 'org.eclipse.cdt.core.ccnature', 'org.eclipse.cdt.core.cnature')
+
+        if changed:
+            project_content = _serialize_xml(root, '<?xml version="1.0" encoding="UTF-8"?>')
+            _write_text_if_changed('.project', project_content)
+
+    except Exception as e:
+        print("Error updating .project file:", e)
+
+def HandleSourceEntries_Global(sourceEntries, excluding):
+    """
+    Configure the project to include the root folder ("") and exclude all 
+    files/folders in the 'excluding' list. This makes all project folders 
+    visible in the IDE.
+    """
+    # To keep the configuration clean, first remove all existing entries
+    for entry in sourceEntries.findall('entry'):
+        sourceEntries.remove(entry)
+
+    # Join the exclusion list into a single string with the '|' separator
+    excluding_str = '|'.join(sorted(excluding))
+
+    # Create a new, single entry for the project root directory
+    SubElement(sourceEntries, 'entry', {
+        'flags': 'VALUE_WORKSPACE_PATH|RESOLVED',
+        'kind': 'sourcePath',
+        'name': "",  # An empty string "" represents the project root
+        'excluding': excluding_str
+    })
 
 def UpdateCproject(env, project, excluding, reset, prj_name):
     excluding = sorted(excluding)
@@ -507,48 +733,64 @@ def UpdateCproject(env, project, excluding, reset, prj_name):
         tools = cconfiguration.findall('storageModule/configuration/folderInfo/toolChain/tool')
         HandleToolOption(tools, env, project, reset)
 
+        if prj_name:
+            config_element = cconfiguration.find('storageModule/configuration')
+            if config_element is not None:
+                config_element.set('artifactName', prj_name)
+
+            pre_build_step = getattr(rtconfig, 'PRE_BUILD_STEP', None)
+            post_build_step = getattr(rtconfig, 'POST_BUILD_STEP', None)
+
+            if pre_build_step:
+                config_element.set('prebuildStep', pre_build_step)
+                print("Setting/Overwriting Pre-build step...")
+
+            if post_build_step:
+                config_element.set('postbuildStep', post_build_step)
+                print("Setting/Overwriting Post-build step...")
+
         sourceEntries = cconfiguration.find('storageModule/configuration/sourceEntries')
-        if sourceEntries != None:
-            entry = sourceEntries.find('entry')
-            HandleExcludingOption(entry, sourceEntries, excluding)
-    # update refreshScope
+        if sourceEntries is not None:
+            # Call the new global handler function for source entries
+            HandleSourceEntries_Global(sourceEntries, excluding)
+            
+    # update refreshScope to ensure the project refreshes correctly
     if prj_name:
-        prj_name = '/' + prj_name
+        prj_name_for_path = '/' + prj_name
         configurations = root.findall('storageModule/configuration')
         for configuration in configurations:
             resource = configuration.find('resource')
-            configuration.remove(resource)
-            SubElement(configuration, 'resource', {'resourceType': "PROJECT", 'workspacePath': prj_name})
+            if resource is not None:
+                configuration.remove(resource)
+            SubElement(configuration, 'resource', {'resourceType': "PROJECT", 'workspacePath': prj_name_for_path})
 
-    # write back to .cproject
-    out = open('.cproject', 'w')
-    out.write('<?xml version="1.0" encoding="UTF-8" standalone="no"?>\n')
-    out.write('<?fileVersion 4.0.0?>')
-    xml_indent(root)
-    out.write(etree.tostring(root, encoding='utf-8').decode('utf-8'))
-    out.close()
+    # write back to .cproject file only when the generated content changed
+    cproject_content = _serialize_xml(
+        root,
+        '<?xml version="1.0" encoding="UTF-8" standalone="no"?>',
+        '<?fileVersion 4.0.0?>'
+    )
+    _write_text_if_changed('.cproject', cproject_content)
 
-
-def TargetEclipse(env, reset=False, prj_name=None):
+def TargetEclipse(env, project, reset=False, prj_name=None):
     global source_pattern
+
+    UpdateProjectName(prj_name)
 
     print('Update eclipse setting...')
 
-    # generate cproject file
     if not os.path.exists('.cproject'):
         if rt_studio.gen_cproject_file(os.path.abspath(".cproject")) is False:
             print('Fail!')
             return
 
-    # generate project file
     if not os.path.exists('.project'):
-        if rt_studio.gen_project_file(os.path.abspath(".project")) is False:
+        project_name = prj_name if prj_name else 'rtthread'
+        if rt_studio.gen_project_file(os.path.abspath(".project"), project_name, IsCppProject()) is False:
             print('Fail!')
             return
 
-    # generate projcfg.ini file
     if not os.path.exists('.settings/projcfg.ini'):
-    # if search files with uvprojx or uvproj suffix
         file = ""
         items = os.listdir(".")
         if len(items) > 0:
@@ -560,31 +802,20 @@ def TargetEclipse(env, reset=False, prj_name=None):
         if rt_studio.gen_projcfg_ini_file(chip_name, prj_name, os.path.abspath(".settings/projcfg.ini")) is False:
             print('Fail!')
             return
-
-    # enable lowwer .s file compiled in eclipse cdt
     if not os.path.exists('.settings/org.eclipse.core.runtime.prefs'):
-        if rt_studio.gen_org_eclipse_core_runtime_prefs(
-                os.path.abspath(".settings/org.eclipse.core.runtime.prefs")) is False:
+        if rt_studio.gen_org_eclipse_core_runtime_prefs(os.path.abspath(".settings/org.eclipse.core.runtime.prefs")) is False:
             print('Fail!')
             return
-
-    # add clean2 target to fix issues when files too many
     if not os.path.exists('makefile.targets'):
         if rt_studio.gen_makefile_targets(os.path.abspath("makefile.targets")) is False:
             print('Fail!')
             return
 
-    project = ProjectInfo(env)
-
-    # update the project file structure info on '.project' file
     UpdateProjectStructure(env, prj_name)
 
-    # generate the exclude paths and files
     excluding = GenExcluding(env, project)
 
-    # update the project configuration on '.cproject' file
     UpdateCproject(env, project, excluding, reset, prj_name)
 
     print('done!')
-
     return
