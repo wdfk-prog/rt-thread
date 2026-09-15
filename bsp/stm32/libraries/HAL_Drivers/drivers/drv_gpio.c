@@ -546,10 +546,13 @@ void HAL_GPIO_EXTI_Falling_Callback(uint16_t GPIO_Pin)
     pin_irq_hdr(bit2bitno(GPIO_Pin));
 }
 #else
+/* The application BSP owns the EXTI callback when USE_GPIO_IRQ is enabled. */
+#ifndef USE_GPIO_IRQ
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
     pin_irq_hdr(bit2bitno(GPIO_Pin));
 }
+#endif /* !USE_GPIO_IRQ */
 #endif
 
 #if defined(SOC_SERIES_STM32F0) || defined(SOC_SERIES_STM32G0) || defined(SOC_SERIES_STM32L0)
@@ -701,6 +704,8 @@ void EXTI15_IRQHandler(void)
 
 #else
 
+/* The application BSP owns the STM32F4-style EXTI IRQ handlers when USE_GPIO_IRQ is enabled. */
+#ifndef USE_GPIO_IRQ
 void EXTI0_IRQHandler(void)
 {
     rt_interrupt_enter();
@@ -758,6 +763,7 @@ void EXTI15_10_IRQHandler(void)
     HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_15);
     rt_interrupt_leave();
 }
+#endif /* !USE_GPIO_IRQ */
 #endif
 
 int rt_hw_pin_init(void)
