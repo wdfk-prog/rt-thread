@@ -772,7 +772,7 @@ def UpdateCproject(env, project, excluding, reset, prj_name):
     )
     _write_text_if_changed('.cproject', cproject_content)
 
-def TargetEclipse(env, project, reset=False, prj_name=None):
+def TargetEclipse(env, reset=False, prj_name=None):
     global source_pattern
 
     UpdateProjectName(prj_name)
@@ -810,6 +810,8 @@ def TargetEclipse(env, project, reset=False, prj_name=None):
         if rt_studio.gen_makefile_targets(os.path.abspath("makefile.targets")) is False:
             print('Fail!')
             return
+
+    project = ProjectInfo(env)
 
     UpdateProjectStructure(env, prj_name)
 
