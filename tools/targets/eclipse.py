@@ -744,35 +744,32 @@ def HandleToolOption(tools, env, project, reset):
     # update linker script config for both C and C++ linker options
     linker_script = 'link.lds'
     raw_linkflags = _stringify_env_flag_list(env['LINKFLAGS']) if 'LINKFLAGS' in env else ''
-    items = raw_linkflags.split(' ')
+    items = raw_linkflags.split()
+
     if '-T' in items:
-        linker_script = items[items.index('-T') + 1]
-        linker_script = ConverToRttEclipsePathFormat(linker_script)
+        index = items.index('-T')
+
+        if index + 1 < len(items):
+            raw_linker_script = items[index + 1].strip('"')
+
+            # LINKFLAGS is interpreted from the SCons/BSP directory, while
+            # Eclipse workspace paths are interpreted from the generated project
+            # root. Convert the physical path to the corresponding Eclipse project
+            # path before wrapping it with ${workspace_loc:...}.
+            eclipse_linker_script = RelativeProjectPath(env, raw_linker_script).replace('\\', '/')
+
+            linker_script = ConverToRttEclipsePathFormat(eclipse_linker_script)
 
     for option in linker_scriptfile_options:
         listOptionValue = option.find('listOptionValue')
-        if listOptionValue != None:
-            if reset is True or IsRttEclipsePathFormat(listOptionValue.get('value')):
-                listOptionValue.set('value', linker_script)
+        if listOptionValue is not None:
+            listOptionValue.set('value', linker_script)
         else:
-            SubElement(option, 'listOptionValue', {'builtIn': 'false', 'value': linker_script})
-    # scriptfile in stm32cubeIDE
+            SubElement(option, 'listOptionValue', {'builtIn': 'false', 'value': linker_script, })
+    # scriptfile in STM32CubeIDE
     for option in linker_script_options:
         if '-T' in items:
-            linker_script = ConverToRttEclipsePathFormat(items[items.index('-T') + 1]).strip('"')
-            option.set('value', linker_script)
-    # update nostartfiles config
-    for option in linker_nostart_options:
-        if raw_linkflags.find('-nostartfiles') != -1:
-            option.set('value', 'true')
-        else:
-            option.set('value', 'false')
-    # update libs
-    for option in linker_libs_options:
-        # remove old libs
-        for item in option.findall('listOptionValue'):
-            if IsRttEclipseLibFormat(item.get("value")):
-                option.remove(item)
+            option.set('value', linker_script.strip('"'))
 
         # add new libs
         if 'LIBS' in env:
