@@ -1,4 +1,4 @@
-#
+
 # Copyright (c) 2006-2022, RT-Thread Development Team
 #
 # SPDX-License-Identifier: Apache-2.0
@@ -31,6 +31,8 @@ from utils import xml_indent
 MODULE_VER_NUM = 6
 
 source_pattern = ['*.c', '*.cpp', '*.cxx', '*.cc', '*.s', '*.S', '*.asm','*.cmd']
+# Source control metadata directories should not be recursively scanned.
+scm_metadata_dirs = ('.git', '.svn', '.hg')
 
 
 def OSPath(path):
@@ -98,16 +100,19 @@ def CollectAllFilesinPath(path, pattern):
     for item in pattern:
         files += glob.glob(path + '/' + item)
 
-    list = os.listdir(path)
-    if len(list):
-        for item in list:
-            if item.startswith('.'):
+    items = os.listdir(path)
+    if len(items):
+        for item in items:
+            # Do not recursively scan source control metadata.
+            if item in scm_metadata_dirs:
                 continue
             if item == 'bsp':
                 continue
 
-            if os.path.isdir(os.path.join(path, item)):
-                files = files + CollectAllFilesinPath(os.path.join(path, item), pattern)
+            fullpath = os.path.join(path, item)
+            if os.path.isdir(fullpath):
+                files += CollectAllFilesinPath(fullpath, pattern)
+
     return files
 
 
@@ -134,6 +139,12 @@ def ExcludePaths(rootpath, paths):
         fullname = os.path.join(OSPath(rootpath), file)
 
         if not os.path.isdir(fullname):
+            continue
+
+        # Source control metadata is never part of the target build.
+        # Exclude it directly instead of recursively scanning it.
+        if file in scm_metadata_dirs:
+            ret.append(fullname)
             continue
 
         # Hidden directories may also contain source files. Keep Eclipse
@@ -891,9 +902,9 @@ def GenExcluding(env, project):
             filtered_exclude_paths.append(path)
             continue
 
-        # Hidden directories that are not selected by SCons can be excluded
-        # directly. Avoid recursively scanning metadata trees such as .git.
-        if os.path.basename(os.path.normpath(path)).startswith('.'):
+        # Source control metadata is never part of the target build and may
+        # contain a very large number of files, so do not recursively scan it.
+        if os.path.basename(os.path.normpath(path)) in scm_metadata_dirs:
             filtered_exclude_paths.append(path)
             continue
 
