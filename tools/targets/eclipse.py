@@ -1,4 +1,4 @@
-#
+
 # Copyright (c) 2006-2022, RT-Thread Development Team
 #
 # SPDX-License-Identifier: Apache-2.0
@@ -131,7 +131,7 @@ def CollectAllFilesinPath(path, pattern):
 
             fullpath = os.path.join(path, item)
             if os.path.isdir(fullpath):
-                files = files + CollectAllFilesinPath(fullpath, pattern)
+                files += CollectAllFilesinPath(fullpath, pattern)
 
     return files
 
@@ -163,6 +163,12 @@ def ExcludePaths(rootpath, paths):
         fullname = os.path.join(OSPath(rootpath), file)
 
         if not os.path.isdir(fullname):
+            continue
+
+        # Source control metadata is never part of the target build.
+        # Exclude it directly instead of recursively scanning it.
+        if file in scm_metadata_dirs:
+            ret.append(fullname)
             continue
 
         # Hidden directories may also contain source files. Keep Eclipse
@@ -920,9 +926,9 @@ def GenExcluding(env, project):
             filtered_exclude_paths.append(path)
             continue
 
-        # Hidden directories that are not selected by SCons can be excluded
-        # directly. Avoid recursively scanning metadata trees such as .git.
-        if os.path.basename(os.path.normpath(path)).startswith('.'):
+        # Source control metadata is never part of the target build and may
+        # contain a very large number of files, so do not recursively scan it.
+        if os.path.basename(os.path.normpath(path)) in scm_metadata_dirs:
             filtered_exclude_paths.append(path)
             continue
 
