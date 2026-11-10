@@ -17,7 +17,6 @@
 
 #include "hpm_clock_drv.h"
 
-#define CAN_SEND_WAIT_MS_MAX   (1000U)       /* CAN maximum wait time for transmission */
 #define CAN_SENDBOX_NUM        (1U)          /* CAN Hardware Transmission buffer number */
 #define CAN_STD_FILTER_NUM_MAX (128U)        /* std Filter number */
 #define CAN_EXT_FILTER_NUM_MAX (64U)         /* ext Filter number */
@@ -86,26 +85,25 @@ static const mcan_filter_elem_t k_default_ext_id_filter = {
 static rt_err_t hpm_mcan_configure(struct rt_can_device *can, struct can_configure *cfg);
 
 /**
- * @brief Control/Get CAN state
- *        including:interrupt, mode, priority, baudrate, filter, status
- * @param [in/out] can CAN device pointer
- * @param [in] cmd Control command
- * @param [in/out] arg Argument pointer
- * @retval RT_EOK for valid control command and arg
- * @retval -RT_ERROR for invalid control command or arg
+ * @brief Control CAN interrupts, configuration, TX cancellation and start/stop.
+ * @param [in,out] can CAN device pointer.
+ * @param [in] cmd Control command.
+ * @param [in,out] arg Command argument, including pointer-encoded mailbox/start values.
+ * @return RT_EOK on success, -RT_EINVAL for an invalid mailbox, or -RT_ERROR on failure.
  */
 static rt_err_t hpm_mcan_control(struct rt_can_device *can, int cmd, void *arg);
 
 /**
- * @brief Send out CAN message
- * @param [in] can CAN device pointer
- * @param [in] buf CAN message buffer
- * @param [in] boxno Mailbox number, it is not used in this porting
- * @retval RT_EOK No error
- * @retval -RT_ETIMEOUT timeout happened
- * @retval -RT_EFULL Transmission buffer is full
+ * @brief Immediately submit a CAN message to dedicated hardware TX Buffer 0.
+ * @param [in] can CAN device pointer.
+ * @param [in] buf CAN message buffer.
+ * @param [in] boxno Generic-visible hardware mailbox index (only 0 is valid).
+ * @return RT_EOK on hardware acceptance, -RT_EBUSY while Buffer 0 is owned,
+ *         -RT_EINVAL for an invalid mailbox, or -RT_ERROR on hardware failure.
  */
-static int hpm_mcan_sendmsg(struct rt_can_device *can, const void *buf, rt_uint32_t boxno);
+static rt_ssize_t hpm_mcan_sendmsg(struct rt_can_device *can, const void *buf, rt_uint32_t boxno);
+static rt_ssize_t hpm_mcan_sendmsg_nonblocking(struct rt_can_device *can,
+                                              const void *buf, rt_uint32_t *mailbox);
 
 /**
  * @brief Receive message from CAN
@@ -116,11 +114,11 @@ static int hpm_mcan_sendmsg(struct rt_can_device *can, const void *buf, rt_uint3
  * @retval -RT_ERROR Error happened during reading receive FIFO
  * @retval -RT_EMPTY no data in receive FIFO
  */
-static int hpm_mcan_recvmsg(struct rt_can_device *can, void *buf, rt_uint32_t boxno);
+static rt_ssize_t hpm_mcan_recvmsg(struct rt_can_device *can, void *buf, rt_uint32_t boxno);
 
 /**
- * @brief Common Interrupt Service routine
- * @param [in] hpm_can HPM CAN pointer
+ * @brief Report Buffer 0 TX completion/cancellation and existing RX/error events.
+ * @param [in] hpm_can HPM CAN pointer.
  */
 static void hpm_mcan_isr(hpm_can_t *hpm_can);
 
@@ -393,6 +391,7 @@ static const struct rt_can_ops hpm_can_ops = {
         .control   = hpm_mcan_control,
         .sendmsg   = hpm_mcan_sendmsg,
         .recvmsg   = hpm_mcan_recvmsg,
+        .sendmsg_nonblocking = hpm_mcan_sendmsg_nonblocking,
 };
 
 
@@ -401,10 +400,19 @@ static void hpm_mcan_isr(hpm_can_t *hpm_can)
 {
     uint8_t error_flags = mcan_get_last_error_code(hpm_can->can_base);
     uint32_t flags = mcan_get_interrupt_flags(hpm_can->can_base);
+    /* TXBTO and TXBCF snapshots identify Buffer 0's completed or cancelled request. */
+    uint32_t tx_completed = hpm_can->can_base->TXBTO & 1UL;
+    uint32_t tx_cancelled = hpm_can->can_base->TXBCF & 1UL;
     mcan_error_count_t err_cnt;
-    /* Transmit completed */
-    if ((flags & (MCAN_EVENT_TRANSMIT)) != 0U) {
-        rt_hw_can_isr(&hpm_can->can_dev, RT_CAN_EVENT_TX_DONE | (0UL << 8));
+    /* Only the dedicated TX Buffer 0 terminal may retire Generic ownership. */
+    if (((flags & MCAN_INT_TX_COMPLETED) != 0U) && (tx_completed != 0U))
+    {
+        rt_hw_can_isr(&hpm_can->can_dev, RT_CAN_EVENT_TX_DONE);
+    }
+    else if (((flags & MCAN_INT_TX_CANCEL_FINISHED) != 0U) &&
+             (tx_cancelled != 0U) && (tx_completed == 0U))
+    {
+        rt_hw_can_isr(&hpm_can->can_dev, RT_CAN_EVENT_TX_FAIL);
     }
 
     /* Data available in FIFO */
@@ -527,7 +535,8 @@ static rt_err_t hpm_mcan_configure(struct rt_can_device *can, struct can_configu
     drv_can->can_config.all_filters_config.ext_id_filter_list.filter_elem_list                        = &drv_can->ext_can_filters[0];
     drv_can->can_config.all_filters_config.ext_id_filter_list.mcan_filter_elem_count                  = drv_can->ext_filter_num;
     drv_can->can_config.all_filters_config.ext_id_mask                                                = (1UL << 30) - 1UL;
-    drv_can->can_config.txbuf_trans_interrupt_mask                                                    = ~0UL;
+    drv_can->can_config.txbuf_trans_interrupt_mask                                                    = 1UL;
+    drv_can->can_config.txbuf_cancel_finish_interrupt_mask                                           = 1UL;
 
     hpm_stat_t status = mcan_init(drv_can->can_base, &drv_can->can_config, can_clk);
     if (status != status_success)
@@ -555,28 +564,35 @@ static rt_err_t hpm_mcan_control(struct rt_can_device *can, int cmd, void *arg)
     {
     case RT_DEVICE_CTRL_CLR_INT:
         arg_val = (uint32_t) arg;
-        intc_m_disable_irq(drv_can->irq_num);
+        /* Only disable the requested source; RX, TX and errors share this IRQ. */
         if (arg_val == RT_DEVICE_FLAG_INT_RX)
         {
             irq_txrx_mask = MCAN_EVENT_RECEIVE;
             drv_can->irq_txrx_err_enable_mask &= ~irq_txrx_mask;
             drv_can->can_config.interrupt_mask &= ~irq_txrx_mask;
-            mcan_disable_interrupts(drv_can->can_base, drv_can->irq_txrx_err_enable_mask);
+            mcan_disable_interrupts(drv_can->can_base, irq_txrx_mask);
         }
         else if (arg_val == RT_DEVICE_FLAG_INT_TX)
         {
-            irq_txrx_mask = MCAN_EVENT_TRANSMIT;
+            irq_txrx_mask = MCAN_INT_TX_COMPLETED | MCAN_INT_TX_CANCEL_FINISHED;
             drv_can->irq_txrx_err_enable_mask &= ~irq_txrx_mask;
             drv_can->can_config.interrupt_mask &= ~irq_txrx_mask;
-            mcan_disable_interrupts(drv_can->can_base, drv_can->irq_txrx_err_enable_mask);
-            mcan_disable_txbuf_interrupt(drv_can->can_base, ~0UL);
+            mcan_disable_interrupts(drv_can->can_base, irq_txrx_mask);
+            mcan_disable_txbuf_transmission_interrupt(drv_can->can_base, 1UL);
+            mcan_disable_txbuf_cancel_finish_interrupt(drv_can->can_base, 1UL);
+            drv_can->can_config.txbuf_trans_interrupt_mask &= ~1UL;
+            drv_can->can_config.txbuf_cancel_finish_interrupt_mask &= ~1UL;
         } else if (arg_val == RT_DEVICE_CAN_INT_ERR) {
             irq_txrx_mask = MCAN_EVENT_ERROR;
             drv_can->irq_txrx_err_enable_mask &= ~irq_txrx_mask;
             drv_can->can_config.interrupt_mask &= ~irq_txrx_mask;
-            mcan_disable_interrupts(drv_can->can_base, drv_can->irq_txrx_err_enable_mask);
+            mcan_disable_interrupts(drv_can->can_base, irq_txrx_mask);
         } else {
             err = -RT_ERROR;
+        }
+        if ((err == RT_EOK) && (drv_can->irq_txrx_err_enable_mask == 0U))
+        {
+            intc_m_disable_irq(drv_can->irq_num);
         }
         break;
     case RT_DEVICE_CTRL_SET_INT:
@@ -591,11 +607,14 @@ static rt_err_t hpm_mcan_control(struct rt_can_device *can, int cmd, void *arg)
         }
         else if (arg_val == RT_DEVICE_FLAG_INT_TX)
         {
-            irq_txrx_mask = MCAN_EVENT_TRANSMIT;
+            irq_txrx_mask = MCAN_INT_TX_COMPLETED | MCAN_INT_TX_CANCEL_FINISHED;
             drv_can->irq_txrx_err_enable_mask |= irq_txrx_mask;
             drv_can->can_config.interrupt_mask |= irq_txrx_mask;
             mcan_enable_interrupts(drv_can->can_base, drv_can->irq_txrx_err_enable_mask);
-            mcan_enable_txbuf_interrupt(drv_can->can_base, ~0UL);
+            mcan_enable_txbuf_transmission_interrupt(drv_can->can_base, 1UL);
+            mcan_enable_txbuf_cancel_finish_interrupt(drv_can->can_base, 1UL);
+            drv_can->can_config.txbuf_trans_interrupt_mask |= 1UL;
+            drv_can->can_config.txbuf_cancel_finish_interrupt_mask |= 1UL;
             intc_m_enable_irq_with_priority(drv_can->irq_num, drv_can->irq_priority);
         }
         else if (arg_val == RT_DEVICE_CAN_INT_ERR)
@@ -611,6 +630,37 @@ static rt_err_t hpm_mcan_control(struct rt_can_device *can, int cmd, void *arg)
             err = -RT_ERROR;
         }
         break;
+    case RT_CAN_CMD_START:
+        if ((rt_ubase_t)arg == 0U)
+        {
+            /* Only a confirmed INIT with no pending request permits FORCE_STOP retirement. */
+            mcan_deinit(drv_can->can_base);
+            if (((drv_can->can_base->CCCR & MCAN_CCCR_INIT_MASK) == 0U) ||
+                mcan_is_transmit_request_pending(drv_can->can_base, 0U))
+            {
+                return -RT_ERROR;
+            }
+            mcan_clear_interrupt_flags(drv_can->can_base,
+                                       MCAN_INT_TX_COMPLETED | MCAN_INT_TX_CANCEL_FINISHED);
+            return RT_EOK;
+        }
+        if ((drv_can->can_base->CCCR & MCAN_CCCR_INIT_MASK) != 0U)
+        {
+            return hpm_mcan_configure(can, &can->config);
+        }
+        return RT_EOK;
+    case RT_CAN_CMD_ABORT_TX:
+        arg_val = (uint32_t)(rt_ubase_t)arg;
+        if (arg_val != 0U)
+        {
+            return -RT_EINVAL;
+        }
+        if (mcan_is_transmit_request_pending(drv_can->can_base, 0U))
+        {
+            /* An abort request does not retire ownership; the TCF IRQ reports TX_FAIL. */
+            drv_can->can_base->TXBCR = 1UL;
+        }
+        return RT_EOK;
     case RT_CAN_CMD_SET_FILTER:
         {
             /* Convert the RT-Thread Filter format to the filter format supported by HPM CAN */
@@ -792,7 +842,7 @@ static rt_err_t hpm_mcan_control(struct rt_can_device *can, int cmd, void *arg)
     return err;
 }
 
-static int hpm_mcan_sendmsg(struct rt_can_device *can, const void *buf, rt_uint32_t boxno)
+static rt_ssize_t hpm_mcan_sendmsg(struct rt_can_device *can, const void *buf, rt_uint32_t boxno)
 {
     RT_ASSERT(can);
 
@@ -800,6 +850,13 @@ static int hpm_mcan_sendmsg(struct rt_can_device *can, const void *buf, rt_uint3
     RT_ASSERT(drv_can);
 
     struct rt_can_msg *can_msg = (struct rt_can_msg *) buf;
+    /* Pending hardware terminal flags block reuse until ISR accounting completes. */
+    uint32_t tx_flags;
+
+    if (boxno != 0U || boxno >= can->config.sndboxnumber)
+    {
+        return -RT_EINVAL;
+    }
 
     mcan_tx_frame_t tx_frame = {0};
     memset(&tx_frame, 0, sizeof(tx_frame));
@@ -842,26 +899,70 @@ static int hpm_mcan_sendmsg(struct rt_can_device *can, const void *buf, rt_uint3
     }
     tx_frame.dlc = can_msg->len;
 
-    uint32_t delay_cnt = 0;
-    while (mcan_is_txfifo_full(drv_can->can_base))
+    if (mcan_is_transmit_request_pending(drv_can->can_base, 0U))
     {
-        rt_thread_mdelay(1);
-        delay_cnt++;
-        if (delay_cnt >= CAN_SEND_WAIT_MS_MAX)
-        {
-            return -RT_ETIMEOUT;
-        }
+        return -RT_EBUSY;
     }
-    hpm_stat_t status = mcan_transmit_via_txbuf_nonblocking(drv_can->can_base, 0, &tx_frame);
+    tx_flags = mcan_get_interrupt_flags(drv_can->can_base);
+    /* Do not reuse Buffer 0 while a previous hardware terminal is unreported. */
+    if ((((tx_flags & MCAN_INT_TX_COMPLETED) != 0U) &&
+         ((drv_can->can_base->TXBTO & 1UL) != 0U)) ||
+        (((tx_flags & MCAN_INT_TX_CANCEL_FINISHED) != 0U) &&
+         ((drv_can->can_base->TXBCF & 1UL) != 0U)))
+    {
+        return -RT_EBUSY;
+    }
+
+    hpm_stat_t status = mcan_transmit_via_txbuf_nonblocking(drv_can->can_base, 0U, &tx_frame);
+    if (status == status_fail)
+    {
+        return -RT_EBUSY;
+    }
     if (status != status_success)
     {
-        return -RT_EFULL;
+        return -RT_ERROR;
     }
 
     return RT_EOK;
 }
 
-static int hpm_mcan_recvmsg(struct rt_can_device *can, void *buf, rt_uint32_t boxno)
+/**
+ * @brief Attempt one nonblocking submit using the same dedicated TX Buffer 0.
+ *
+ * The Generic TX lock serializes this call with blocking submits, while the
+ * blocking-owner bit prevents reuse before the blocking waiter reclaims its slot.
+ * @param [in] can CAN device pointer.
+ * @param [in] buf CAN message to submit.
+ * @param [out] mailbox Receives hardware mailbox 0 only on successful submit.
+ * @return RT_EOK on hardware acceptance, -RT_EBUSY if owned, -RT_EINVAL for a
+ *         missing output pointer, or the immediate hardware submit error.
+ */
+static rt_ssize_t hpm_mcan_sendmsg_nonblocking(struct rt_can_device *can,
+                                              const void *buf, rt_uint32_t *mailbox)
+{
+    /* Immediate submission result, not a bus-transmission completion status. */
+    rt_ssize_t result;
+
+    RT_ASSERT(can);
+    RT_ASSERT(buf);
+    if (mailbox == RT_NULL)
+    {
+        return -RT_EINVAL;
+    }
+    /* A completed blocking slot remains owned until its waiter reclaims it. */
+    if ((can->status.sndchange & 1UL) != 0U)
+    {
+        return -RT_EBUSY;
+    }
+    result = hpm_mcan_sendmsg(can, buf, 0U);
+    if (result == RT_EOK)
+    {
+        *mailbox = 0U;
+    }
+    return result;
+}
+
+static rt_ssize_t hpm_mcan_recvmsg(struct rt_can_device *can, void *buf, rt_uint32_t boxno)
 {
     RT_ASSERT(can);
 
